@@ -107,8 +107,8 @@ main { position: relative; height: 100%; display: grid; place-items: center; }
 #vol .k { color: var(--p5); } #vol .v { text-align: right; color: var(--p4); }
 #vol input[type=range] { width: 100%; accent-color: var(--p3); height: 14px; background: transparent; cursor: pointer; }
 #vol .row.off { opacity: .45; } #vol .row.off input { cursor: default; }
-/* v22: качество картинки — три кнопки в ряд, выбранная подсвечена */
-#vol .row.q { grid-template-columns: auto 1fr; }
+/* v22: качество картинки — кнопки в ряд, выбранная подсвечена; v24: четыре кнопки — ряд под подписью, во всю ширину */
+#vol .row.q { grid-template-columns: 1fr; gap: 4px; }
 .seg { display: flex; border: 1px solid var(--panel-edge); border-radius: 10px; overflow: hidden; }
 .seg button { flex: auto; font: inherit; font-size: 9.5px; letter-spacing: .03em; text-transform: uppercase; color: var(--p4); background: transparent;
   border: 0; border-left: 1px solid var(--line); padding: 5px 5px; cursor: pointer; white-space: nowrap; transition: background .2s, color .2s; }
@@ -155,6 +155,16 @@ main { position: relative; height: 100%; display: grid; place-items: center; }
   box-shadow: 0 0 40px 4px rgba(146,191,189,.18), var(--ca-box), var(--glass-in); transition: transform .2s, background .2s; }
 @media (hover: hover) { #gate-btn:hover { background: rgba(146,191,189,.34); transform: translateY(-1px); } }
 #gate-btn:active { transform: translateY(1px); }
+/* v24: ход загрузки на экране входа и кнопка облегчённого режима; надпись при потере картинки (WebGL) */
+#gate-load { margin: 14px auto 0; max-width: 300px; font-size: 10px; letter-spacing: .04em; text-transform: none; color: var(--p5); }
+#gate-load .bar { height: 2px; margin-bottom: 6px; border-radius: 2px; background: rgba(211,220,211,.14); overflow: hidden; }
+#gate-load .bar i { display: block; height: 100%; width: 0; background: var(--p3); transition: width .4s ease; }
+#gate-lite { margin-top: 10px; font: inherit; font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--p4);
+  background: transparent; border: 1px solid var(--panel-edge); border-radius: 10px; padding: 6px 12px; cursor: pointer; }
+#gl-lost { position: fixed; left: 50%; top: 40%; transform: translate(-50%, -50%); z-index: 60; text-align: center; padding: 16px 22px;
+  border-radius: 16px; background: var(--panel); border: 1px solid var(--panel-edge); color: var(--p4); font-size: 12px; }
+#gl-lost button { margin-top: 10px; font: inherit; font-size: 11px; color: #eef4ee; background: rgba(146,191,189,.25); border: 1px solid var(--panel-edge);
+  border-radius: 10px; padding: 7px 14px; cursor: pointer; }
 #gate-err { margin: 16px 0 0; font-size: 11px; color: var(--red); max-width: 320px; letter-spacing: .04em; text-transform: none; }
 
 /* v14: телефоны и любые экраны (16:9, 21:9, 4:3). Сцена всегда на весь экран (раньше на узком экране панели уезжали
@@ -219,16 +229,21 @@ html, body { height: var(--app-h, 100dvh); overscroll-behavior: none; }   /* v23
 }
 /* v23: бестиарий — окно-«стекло» поверх мира (мир на паузе); новый найденный вид подсвечивает кнопку */
 #bst-btn.new { border-color: rgba(238,244,238,.9); box-shadow: 0 0 14px rgba(146,191,189,.6), var(--glass-in); }
-#bestiary { position: fixed; inset: 0; z-index: 56; display: grid; place-items: center; background: rgba(14,23,21,.35); }
+/* v24: на телефоне окно было выше экрана (процент высоты в сетке не ограничивал его) — «Мелкие обитатели» и «Редкое»
+   уходили за край, а список прокручивался на 24 точки. Теперь высота — видимая (--app-h), отступы — от выреза экрана,
+   список внутри прокручивается (min-height: 0 у flex-элемента) */
+#bestiary { position: fixed; inset: 0 0 auto 0; height: var(--app-h, 100dvh); z-index: 56; display: flex; align-items: center; justify-content: center;
+  box-sizing: border-box; padding: max(10px, env(safe-area-inset-top)) max(10px, env(safe-area-inset-right)) max(10px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
+  background: rgba(14,23,21,.35); }
 #bestiary[hidden] { display: none; }
-#bst-win { width: min(980px, calc(100% - 24px)); max-height: calc(100% - 24px); display: flex; flex-direction: column; background: var(--panel);
+#bst-win { width: min(980px, 100%); max-height: 100%; display: flex; flex-direction: column; background: var(--panel);
   border: 1px solid var(--panel-edge); border-radius: 18px; box-shadow: var(--ca-box), var(--glass-in), 0 18px 60px rgba(0,0,0,.35);
   backdrop-filter: var(--glass); -webkit-backdrop-filter: var(--glass); text-shadow: var(--ca); }
 #bst-win header { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
 #bst-win header h3 { margin: 0; font-size: 13px; letter-spacing: .16em; color: var(--p3); flex: auto; }
 #bst-count { font-size: 11px; color: var(--p4); }
 #bst-close { font: inherit; color: var(--p4); background: rgba(211,220,211,.1); border: 1px solid var(--line); border-radius: 50%; width: 28px; height: 28px; padding: 0; cursor: pointer; }
-#bst-body { overflow-y: auto; padding: 0 14px 14px; overscroll-behavior: contain; touch-action: pan-y; scrollbar-width: thin; scrollbar-color: rgba(146,191,189,.45) transparent; }
+#bst-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0 14px 14px; overscroll-behavior: contain; touch-action: pan-y; scrollbar-width: thin; scrollbar-color: rgba(146,191,189,.45) transparent; }
 #bst-body h4 { margin: 12px 0 8px; font-size: 10.5px; letter-spacing: .14em; color: var(--p5); font-weight: 600; }
 .bst-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 10px; }
 .bst-card { font: inherit; text-transform: uppercase; color: var(--p4); background: rgba(211,220,211,.06); border: 1px solid var(--line); border-radius: 12px;
@@ -298,7 +313,7 @@ body.gate-open #fs { opacity: 0; visibility: hidden; pointer-events: none; trans
     <h2>НАСТРОЙКИ</h2>
     <div class="row"><label class="k" for="vol-nature">Природа</label><input id="vol-nature" type="range" min="0" max="100" value="100"><span id="v-nature" class="v">100</span></div>
     <div class="row" title="Абстрактный слой: искажённое «эхо» звуков мира"><label class="k" for="vol-music">Музыка</label><input id="vol-music" type="range" min="0" max="100" value="70"><span id="v-music" class="v">70</span></div>
-    <div class="row q"><span class="k">Картинка</span><div class="seg" id="quality" role="group" aria-label="Качество картинки"><button data-q="auto" title="Само снижает качество, если устройство не успевает (не ниже чёткого)">Авто</button><button data-q="high">Высокое</button><button data-q="low">Низкое</button></div></div>
+    <div class="row q"><span class="k">Картинка</span><div class="seg" id="quality" role="group" aria-label="Качество картинки"><button data-q="auto" title="Само снижает качество, если устройство не успевает (не ниже чёткого)">Авто</button><button data-q="high">Высокое</button><button data-q="low">Низкое</button><button data-q="lite" title="Для устройств с малой памятью: меньше деталей, звук догружается по мере надобности">Лёгкое</button></div></div>
   </section>
   <section id="log" class="panel"><h2>ЖУРНАЛ СОБЫТИЙ</h2><ul id="log-list"></ul></section>
   <div id="tip"></div>
@@ -330,11 +345,14 @@ body.gate-open #fs { opacity: 0; visibility: hidden; pointer-events: none; trans
 <button id="fs">⛶ На весь экран</button>
 <div id="rotate"><div><div class="phone"></div><p class="tel">Поверните телефон горизонтально</p><p class="pc">Растяните окно шире</p><small>океан задуман для широкого экрана</small></div></div>
 
+<div id="gl-lost" hidden><p></p><button hidden>Перезапустить в облегчённом режиме</button></div>
 <div id="gate">
   <div id="gate-card">
     <h1>Abyssonata</h1>
     <p>Звук играет прямо здесь, в браузере</p>
     <button id="gate-btn">Войти в океан</button>
+    <div id="gate-load"><div class="bar"><i></i></div><span></span></div>
+    <button id="gate-lite" hidden>Войти в облегчённом режиме</button>
     <br><a id="gate-lic" href="credits.html" target="_blank" rel="noopener">Авторы и лицензии</a>
   </div>
 </div>
@@ -344,12 +362,15 @@ body.gate-open #fs { opacity: 0; visibility: hidden; pointer-events: none; trans
 // v21: понятное сообщение вместо белого/«мёртвого» экрана (обычный скрипт — работает в любом браузере): нет WebGL 2 —
 // сразу; код океана упал при старте или не запустился за 40 с (старый браузер, мало памяти) — на экране входа
 (function () {
-  function show(msg) {
+  function show(msg, lite) {
     var card = document.getElementById('gate-card'), btn = document.getElementById('gate-btn');
     if (!card || window.__omReady) return;
     if (btn) btn.style.display = 'none';
     var m = document.getElementById('gate-err') || document.createElement('p');
     m.id = 'gate-err'; m.textContent = msg; if (!m.parentNode) card.appendChild(m);
+    // v24: перезапуск в облегчённом режиме (мало памяти — частая причина)
+    if (lite && !/[?&]lite=1/.test(location.search)) { var a = document.createElement('a'); a.href = location.pathname + '?lite=1'; a.textContent = 'Открыть в облегчённом режиме';
+      a.style.cssText = 'display:block;margin-top:10px;color:inherit'; m.appendChild(a); }
   }
   // v22: старый браузер (iOS 14 и раньше) — сразу понятное сообщение, а не белый экран или ожидание 40 с: проверяем
   // модули и самый новый синтаксис, который есть в коде океана (?., ??=, ||=)
@@ -357,9 +378,11 @@ body.gate-open #fs { opacity: 0; visibility: hidden; pointer-events: none; trans
   try { new Function('var a = {}; a.b ??= 1; a.c ||= 2; return a?.b'); } catch (e) { modern = false; }
   if (!modern) { show('Этот браузер слишком старый для океана. Обновите систему (на iPhone — iOS 15 или новее) или браузер, либо откройте сайт на другом устройстве.'); return; }
   var gl = null; try { gl = document.createElement('canvas').getContext('webgl2'); } catch (e) {}
+  // v24: проверочный контекст сразу отдаём — на слабом телефоне лишний живой контекст отнимает видеопамять у океана
+  try { if (gl) { var lc = gl.getExtension('WEBGL_lose_context'); if (lc) lc.loseContext(); } } catch (e) {}
   if (!gl) { show('На этом устройстве океан не запустится: браузер не поддерживает 3D-графику WebGL 2. Обновите систему или браузер (на iPhone — iOS 15 и новее) или откройте сайт на другом устройстве.'); return; }
-  window.addEventListener('error', function (e) { show('Океан не смог запуститься на этом устройстве: ' + (e.message || 'ошибка') + '. Попробуйте обновить браузер или открыть сайт на другом устройстве.'); });
-  setTimeout(function () { show('Океан не запустился на этом устройстве (слишком старый браузер или не хватает памяти). Попробуйте обновить систему/браузер или открыть сайт на компьютере.'); }, 40000);
+  window.addEventListener('error', function (e) { show('Океан не смог запуститься на этом устройстве: ' + (e.message || 'ошибка') + '. Попробуйте обновить браузер или открыть сайт на другом устройстве.', true); });
+  setTimeout(function () { show('Океан не запустился на этом устройстве (слишком старый браузер или не хватает памяти). Попробуйте обновить систему/браузер или открыть сайт на компьютере.', true); }, 40000);
 })();
 </script>
 <script type="module" src="main.js"></script>

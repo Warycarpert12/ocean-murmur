@@ -13,6 +13,7 @@ import { GLTFLoader } from './three-addons/loaders/GLTFLoader.js';
 import * as SkeletonUtils from './three-addons/utils/SkeletonUtils.js';
 import { mergeGeometries } from './three-addons/utils/BufferGeometryUtils.js';
 import { Noise2D } from './noise.js';
+import { step, within } from './boot.js';
 THREE.ColorManagement.enabled = false;
 
 const $ = s => document.querySelector(s);
@@ -33,6 +34,7 @@ const mix3 = (a, b, t) => a.map((v, i) => lerp(v, b[i], t));
 const rnd = (a, b) => a + Math.random() * (b - a);
 // v23: на время fn Math.random — свой повторяемый генератор: новые украшения не сдвигают случайные числа мира (с ?rseed
 // мир и звери те же, что в main, — честное сравнение кадров и снимки «было / стало»)
+const LAZY = new Set(['shark', 'orca']);   // v24: в «Лёгком» — модель при первом появлении
 const seededRandom = (seed, fn) => {
   const mr = Math.random; let s = seed >>> 0;
   Math.random = () => { s = (s + 0x6D2B79F5) >>> 0; let x = Math.imul(s ^ (s >>> 15), 1 | s); x ^= x + Math.imul(x ^ (x >>> 7), 61 | x); return ((x ^ (x >>> 14)) >>> 0) / 4294967296; };
@@ -108,8 +110,21 @@ function shoreAt(k, a, h = .5) {
   if (r === undefined) { r = s.r * .3; while (r < s.r * 3 && islandH(s.cx + Math.sin(a) * r, s.cz + Math.cos(a) * r) > h) r += .25; _edge.set(key, r); }
   return { x: s.cx + Math.sin(a) * r, z: s.cz + Math.cos(a) * r, dx: Math.sin(a), dz: Math.cos(a) };
 }
+// v24: высота рельефа для покадровых проверок зверей (мель под «пятном», земля под лапами) — из готовой карты 512²
+// (Visual._buildTerrain, билинейно), а не islandH (шумы): на телефоне islandH была ~10% всего JS кадра. Разница —
+// сантиметры; за краем карты рельеф и так ровно −10 (islandH там даёт то же). До постройки карты — islandH
+let HM = null;
+function hq(x, z) {
+  if (!HM) return islandH(x, z);
+  const TS = 512, fx = (x + S) / (2 * S) * TS - .5, fz = (z + S) / (2 * S) * TS - .5;
+  if (!(fx >= 0 && fz >= 0 && fx < TS - 1 && fz < TS - 1)) return -10;
+  const i = fx | 0, j = fz | 0, u = fx - i, v = fz - j, k = j * TS + i;
+  return (HM[k] * (1 - u) + HM[k + 1] * u) * (1 - v) + (HM[k + TS] * (1 - u) + HM[k + TS + 1] * u) * v;
+}
 // высота земли под «лапами»: максимум по пятну радиуса rad — на склоне зверь не уходит брюхом в песок
-const groundAt = (x, z, rad) => Math.max(islandH(x, z), islandH(x + rad, z), islandH(x - rad, z), islandH(x, z + rad), islandH(x, z - rad));
+// v24: сетка флоры для поиска растений рядом со зверем (_floraAvoid): клетки 8 м на ±176 м
+const FNG = 44, fCell = v => Math.min(FNG - 1, Math.max(0, Math.floor((v + 176) / 8)));
+const groundAt = (x, z, rad) => Math.max(hq(x, z), hq(x + rad, z), hq(x - rad, z), hq(x, z + rad), hq(x, z - rad));
 // v12: крупные звери заплывали в острова. deepSpot двигает точку p туда, где под всем «пятном» радиуса rad глубже need:
 // прочь от самого мелкого места пятна (центр и 12 точек на двух кольцах — островок меньше пятна кита не проскочит),
 // шагами по step метров. ponytail: жадный поиск, в узком проливе между двумя островками может не найти — тогда
@@ -118,11 +133,11 @@ const PROBE = [...Array(8)].map((_, k) => [Math.cos(k * Math.PI / 4), Math.sin(k
   .concat([...Array(4)].map((_, k) => [Math.cos(k * Math.PI / 2 + .8), Math.sin(k * Math.PI / 2 + .8), .5]));
 function deepSpot(p, need, rad, step = 3, iters = 30) {
   for (let i = 0; i < iters; i++) {
-    let g = islandH(p.x, p.z), bx = 0, bz = 0;
-    for (const [c, sn, k] of PROBE) { const h = islandH(p.x + c * rad * k, p.z + sn * rad * k); if (h > g) { g = h; bx = c * k; bz = sn * k; } }
+    let g = hq(p.x, p.z), bx = 0, bz = 0;
+    for (const [c, sn, k] of PROBE) { const h = hq(p.x + c * rad * k, p.z + sn * rad * k); if (h > g) { g = h; bx = c * k; bz = sn * k; } }
     if (g <= need) return p;
     if (bx || bz) { const l = Math.hypot(bx, bz); p.x -= bx / l * step; p.z -= bz / l * step; }
-    else { const e = 2, gx = islandH(p.x + e, p.z) - islandH(p.x - e, p.z), gz = islandH(p.x, p.z + e) - islandH(p.x, p.z - e), L = Math.hypot(gx, gz) || 1; p.x -= gx / L * step; p.z -= gz / L * step; }
+    else { const e = 2, gx = hq(p.x + e, p.z) - hq(p.x - e, p.z), gz = hq(p.x, p.z + e) - hq(p.x, p.z - e), L = Math.hypot(gx, gz) || 1; p.x -= gx / L * step; p.z -= gz / L * step; }
   }
   // v18: на холмистой макушке островка жадный поиск топчется на месте (пеликан «садился» на остров) — тогда прочь
   // от центра ближайшего острова по прямой, пока под пятном не станет глубоко
@@ -135,7 +150,7 @@ function deepSpot(p, need, rad, step = 3, iters = 30) {
 }
 // v18: насколько мелко под «пятном» радиуса rad: сумма «лишней» высоты над need в центре и на кольцах PROBE (0 — везде
 // глубоко). Сумма, а не максимум: по максимуму круг, задевший вершину островка, мог «переехать» через неё
-const shoal = (x, z, rad, need) => { let g = Math.max(0, islandH(x, z) - need); for (const [c, sn, k] of PROBE) g += Math.max(0, islandH(x + c * rad * k, z + sn * rad * k) - need); return g; };
+const shoal = (x, z, rad, need) => { let g = Math.max(0, hq(x, z) - need); for (const [c, sn, k] of PROBE) g += Math.max(0, hq(x + c * rad * k, z + sn * rad * k) - need); return g; };
 // v18: шаг якоря пловца к цели в обход мели. Раньше якорь шёл к цели по прямой, а от мели его отталкивало слабее
 // (0.7 хода) — кит медленно, но «проезжал» через островок. Теперь: прямо, если впереди глубоко; иначе отклоняемся
 // (сначала в ту же сторону, что и в прошлый раз — не виляем) до 160°; мелко уже здесь — годится только шаг на глубину
@@ -262,8 +277,10 @@ const SPEED = { seagull: 9, tern: 10, cormorant: 8, albatross: 7, pelican: 7, do
   jellyfish: 1.2, sea_turtle: 2, stingray: 3, crab: 1.5, starfish: .3, octopus: .8, shrimp_swarm: 2, ship: 15 };
 
 export class Visual {
-  constructor(stageEl) {
-    this.stage = stageEl;
+  // v24: lite — «Лёгкое» качество с самого начала: текстуры моделей до 256 точек (иначе до 1024), редкие гости (акула,
+  // косатка) грузятся при первом появлении
+  constructor(stageEl, { lite = false } = {}) {
+    this.stage = stageEl; this.lite = lite;
     this.canvas = $('#gl');
     this.logList = $('#log-list'); this.flashEl = $('#flash'); this.tipEl = $('#tip');
     this.cur = { tod: .5, daylight: 1, weather: .3, wind: .3, wave: .3, temp: .5, tension: .1, rain: 0, fog: 0 };
@@ -315,7 +332,7 @@ export class Visual {
     controls.minDistance = 3; controls.maxDistance = 120; controls.zoomToCursor = true;
     // медленное вращение вокруг всей локации, как в образце (~3 мин на оборот): сразу при входе и снова через 12 с после того,
     // как камеру отпустили; пока держишь камеру или следишь за зверем — стоит
-    controls.autoRotateSpeed = .35; this._idle = 99;
+    this._idle = 99;
     // взялся за камеру сам: v22 — при слежении за зверем камера крутится вокруг него и приближается (слежение остаётся,
     // выход — Esc или «✕» на плашке, см. main.js); без слежения — как раньше
     controls.addEventListener('start', () => { if (this._follow) this._follow.user = true; this._fly = null; this._drag = true; this._idle = 0; });
@@ -324,6 +341,11 @@ export class Visual {
     controls.maxPolarAngle = Math.PI * .47;   // можно опустить камеру почти к воде и посмотреть на небо
     controls.update();
 
+    // v24: потеря контекста WebGL (не хватило видеопамяти, драйвер перезапустился): браузеру — «восстанови» (preventDefault),
+    // main.js показывает сообщение и после восстановления снижает качество. three.js сам заново загружает всё в видеокарту
+    this.lost = false;
+    this.canvas.addEventListener('webglcontextlost', e => { e.preventDefault(); this.lost = true; this.onLost?.(); });
+    this.canvas.addEventListener('webglcontextrestored', () => { this.lost = false; this.onRestored?.(); });
     renderer.domElement.style.touchAction = 'none';
     renderer.domElement.addEventListener('pointermove', ev => {
       const r = this.stage.getBoundingClientRect();
@@ -331,8 +353,27 @@ export class Visual {
       this._mouseOver = true;
     });
     renderer.domElement.addEventListener('pointerleave', () => { this._mouseOver = false; });
+    // v24: двойной клик (ПК) или двойное касание (телефон) по зверю — слежение за ним, как из «Обитателей»/журнала.
+    // Касание — короткое (до 0.3 с) и почти без движения (до 10 px), второе — не позже 0.35 с и не дальше 30 px от
+    // первого: вращение камеры (перетаскивание) и приближение двумя пальцами двойным касанием не считаются
+    const followAt = (cx, cy) => { const r = this.stage.getBoundingClientRect(), o = this._pickAt(cx - r.left, cy - r.top, 1.3); if (o) this.followAgent(o); };
+    renderer.domElement.addEventListener('dblclick', e => followAt(e.clientX, e.clientY));
+    let td = null, tLast = null; const fingers = new Set();
+    renderer.domElement.addEventListener('pointerdown', e => { if (e.pointerType === 'mouse') return; fingers.add(e.pointerId);
+      td = fingers.size === 1 ? { id: e.pointerId, x: e.clientX, y: e.clientY, t: performance.now() } : null; });
+    renderer.domElement.addEventListener('pointermove', e => { if (td && e.pointerId === td.id && Math.hypot(e.clientX - td.x, e.clientY - td.y) > 10) td = null; });
+    for (const ev of ['pointercancel', 'pointerup']) renderer.domElement.addEventListener(ev, e => {
+      if (e.pointerType === 'mouse') return; fingers.delete(e.pointerId);
+      const now = performance.now(), tap = ev === 'pointerup' && td && e.pointerId === td.id && now - td.t < 300 && Math.hypot(e.clientX - td.x, e.clientY - td.y) <= 10; td = null;
+      if (!tap) { tLast = null; return; }
+      if (tLast && now - tLast.t < 350 && Math.hypot(e.clientX - tLast.x, e.clientY - tLast.y) <= 30) { tLast = null; followAt(e.clientX, e.clientY); }
+      else tLast = { x: e.clientX, y: e.clientY, t: now };
+    });
 
     this.uPix = { value: 1 }; this.uBright = { value: 1 }; this.uT = { value: 0 }; this.uWind = { value: .1 }; this.uRimK = { value: .5 }; this.uGlowK = { value: 0 };
+    // v24: переключатели для ?bench=1 (bench.js): точечная фактура, качание флоры; uAvN — сколько зверей сейчас
+    // раздвигают флору (цикл в вершинном шейдере не крутит пустые места)
+    this.uStip = { value: 1 }; this.uFloraAnim = { value: 1 }; this.uAvN = { value: 0 };
     this.glowTex = this._glowTexture();
     this._buildPost();
 
@@ -493,7 +534,7 @@ export class Visual {
 
     // карта высот для воды (глубина → цвет мелководья и пена у берега), в метрах, half-float.
     // Было 8 бит (шаг 8 см): у пологого берега кромка пены выходила лесенкой из квадратов и мерцала при повороте камеры
-    const TS = 512, data = new Uint16Array(TS * TS), hm = this.hmap = new Float32Array(TS * TS);
+    const TS = 512, data = new Uint16Array(TS * TS), hm = this.hmap = HM = new Float32Array(TS * TS);
     for (let j = 0; j < TS; j++) for (let i = 0; i < TS; i++) {
       const x = (i + .5) / TS * 2 * S - S, z = (j + .5) / TS * 2 * S - S;
       data[j * TS + i] = THREE.DataUtils.toHalfFloat(hm[j * TS + i] = islandH(x, z));
@@ -505,12 +546,7 @@ export class Visual {
   }
 
   // v22: высота рельефа из готовой карты (512×512 на ±S, билинейно) — в разы дешевле islandH; для сотен рыбок каждый кадр
-  _h(x, z) {
-    const TS = 512, fx = (x + S) / (2 * S) * TS - .5, fz = (z + S) / (2 * S) * TS - .5;
-    if (!(fx >= 0 && fz >= 0 && fx < TS - 1 && fz < TS - 1)) return -10;   // за краем карты — дно (см. bed)
-    const i = fx | 0, j = fz | 0, u = fx - i, v = fz - j, m = this.hmap, k = j * TS + i;
-    return (m[k] * (1 - u) + m[k + 1] * u) * (1 - v) + (m[k + TS] * (1 - u) + m[k + TS + 1] * u) * v;
-  }
+  _h(x, z) { return hq(x, z); }   // за краем карты — дно (см. bed)
   // v22: рыбка не в рельефе: под ней должно быть не меньше ~0.8 м воды. Мелко — точка подтягивается к центру её круга
   // (cx, cz), потом к точке стайки (c); не нашлось глубины — рыбка на этот кадр скрыта. Высота — между дном+0.35 и −0.3.
   // Возвращает false, если рыбку надо скрыть. P меняется на месте
@@ -538,11 +574,12 @@ export class Visual {
   }
   _stippled(mat, local = false, k = 5.5) {
     return this._hook(mat, sh => {
+      sh.uniforms.uStip = this.uStip;
       sh.vertexShader = 'varying vec3 vSP; varying vec3 vSN;\n' + sh.vertexShader.replace('#include <skinning_vertex>', '#include <skinning_vertex>\n' + (local
         ? ' vSP = transformed * length(modelMatrix[0].xyz); vSN = objectNormal;'
         : ' vSP = (modelMatrix * vec4(transformed, 1.)).xyz; vSN = normalize(mat3(modelMatrix) * objectNormal);'));
-      sh.fragmentShader = 'varying vec3 vSP; varying vec3 vSN;\n' + STIPPLE + sh.fragmentShader.replace('#include <alphamap_fragment>',
-        `diffuseColor.rgb = stipple(diffuseColor.rgb, vSP, vSN, ${local ? '1.' : 'smoothstep(.2, .6, vSP.y)'}, ${k.toFixed(2)});\n#include <alphamap_fragment>`);
+      sh.fragmentShader = 'uniform float uStip; varying vec3 vSP; varying vec3 vSN;\n' + STIPPLE + sh.fragmentShader.replace('#include <alphamap_fragment>',
+        `if (uStip > .5) diffuseColor.rgb = stipple(diffuseColor.rgb, vSP, vSN, ${local ? '1.' : 'smoothstep(.2, .6, vSP.y)'}, ${k.toFixed(2)});\n#include <alphamap_fragment>`);
     }, `st${local ? 'L' : 'W'}${k}`);
   }
 
@@ -577,7 +614,7 @@ export class Visual {
         void main() { vec2 c = gl_PointCoord - .5; float d = length(c); if (d > .5) discard;
           gl_FragColor = vec4(vCol * uBright * (1.08 - d * .5), 1.); }`,   // лёгкий объём шарика
     });
-    const p = new THREE.Points(g, m); this.scene.add(p); return p;
+    const p = new THREE.Points(g, m); this.scene.add(p); (this.decor ||= []).push(p); return p;
   }
   // ореолы вокруг светящихся точек (цветы, кораллы, кончики анемонов) — «люмен»: мягкое пятно в 4 размера точки,
   // размер в метрах мира — одинаково издалека и вблизи. Ночью и в сумерки; днём слой скрыт (см. frame)
@@ -608,7 +645,7 @@ export class Visual {
         void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(sway(position), 1.); vCol = aCol; }`,
       fragmentShader: `uniform float uBright; varying vec3 vCol; void main() { gl_FragColor = vec4(vCol * uBright, 1.); }`,
     });
-    const l = new THREE.LineSegments(g, m); this.scene.add(l); return l;
+    const l = new THREE.LineSegments(g, m); this.scene.add(l); (this.decor ||= []).push(l); return l;
   }
 
   // абстрактная флора (решение 22.09): пучки травы-линий, кустики из шариков, «цветы-молекулы» (бывшие кораллы —
@@ -807,18 +844,39 @@ export class Visual {
     // расступание), E — свечение кончиков ночью
     const AV = this.AVOID = 10;
     this.uAvoid = { value: Array.from({ length: AV }, () => new THREE.Vector4(0, -9999, 0, 1)) };
+    this.uAvoidV = { value: Array.from({ length: AV }, () => new THREE.Vector4()) };   // v24: скорость зверя (xz) и сила (w)
     const mat = (F, E, side, B) => this._hook(this._stippled(new THREE.MeshLambertMaterial({ vertexColors: true, side }), true, 14), sh => {
-      Object.assign(sh.uniforms, { uT: this.uT, uGlowK: this.uGlowK, uAvoid: this.uAvoid });
-      sh.vertexShader = `uniform float uT; uniform vec4 uAvoid[${AV}]; attribute float aTip; varying float vTip;\n` + sh.vertexShader.replace('#include <project_vertex>', `
+      Object.assign(sh.uniforms, { uT: this.uT, uGlowK: this.uGlowK, uAvoid: this.uAvoid, uAvoidV: this.uAvoidV, uFloraAnim: this.uFloraAnim, uAvN: this.uAvN });
+      sh.vertexShader = `uniform float uT, uFloraAnim; uniform int uAvN; uniform vec4 uAvoid[${AV}], uAvoidV[${AV}]; attribute float aTip, aNear; varying float vTip;\n` + sh.vertexShader.replace('#include <project_vertex>', `
         vTip = aTip;
         vec4 wp = modelMatrix * instanceMatrix * vec4(transformed, 1.);
         vec3 ip = (modelMatrix * instanceMatrix * vec4(0., 0., 0., 1.)).xyz;
         float hm = max(0., wp.y - ip.y);
-        ${F ? `wp.xz += vec2(sin(uT * .8 + ip.x * .37 + hm * .5), cos(uT * .63 + ip.z * .29 + hm * .4)) * hm * hm / (hm + 1.) * ${(F * .09).toFixed(3)};
-        for (int i = 0; i < ${AV}; i++) {   // зверь рядом — стебли отклоняются от него и чуть пригибаются (корни на месте)
-          vec4 a = uAvoid[i]; vec2 d = wp.xz - a.xz; float L = length(d) + .001;
-          float k = (1. - smoothstep(a.w * .3, a.w * 1.3, L)) * (1. - smoothstep(a.w * .4, a.w * 1.6, abs(wp.y - a.y))) * smoothstep(0., 1.2, hm);
-          wp.xz += d / L * k * a.w * .8; wp.y -= k * hm * .2;
+        ${F ? `if (uFloraAnim > .5) {
+        wp.xz += vec2(sin(uT * .8 + ip.x * .37 + hm * .5), cos(uT * .63 + ip.z * .29 + hm * .4)) * hm * hm / (hm + 1.) * ${(F * .09).toFixed(3)};
+        // v24: зверь рядом — стебли мягко расходятся и слегка наклоняются. Было: сдвиг до 0.8 радиуса тела (кит — 8 м) уже
+        // с высоты 1.2 м — ламинария ложилась почти горизонтально и разлеталась (видео автора). Теперь: сдвиг вбок не
+        // больше 1.6 м от всех зверей вместе, изгиб плавный по высоте (корни на месте), верх при наклоне чуть опускается
+        // (длина стебля сохраняется), позади зверя — затухающий след на ~1.5 с хода: стебли возвращаются постепенно
+        // v24: aNear — зверь может дотянуться до этого растения (_floraAvoid); остальным расчёт не нужен — вклад нулевой
+        if (aNear > .5) {
+        vec2 push = vec2(0.);
+        for (int i = 0; i < ${AV}; i++) {
+          if (i >= uAvN) break;
+          vec4 a = uAvoid[i], av = uAvoidV[i];
+          // v24: дальше, чем достаёт зверь (тело + след), — сразу к следующему: на телефоне полный расчёт для всех
+          // ~860 тыс. вершин флоры стоил ~9 мс кадра (?bench=1). Результат тот же: там k = 0. av.y — квадрат досягаемости
+          vec2 e0 = wp.xz - a.xz; if (dot(e0, e0) > av.y || abs(wp.y - a.y) > a.w * 1.6) continue;
+          float sp = length(av.xz); vec2 dir = sp > .05 ? av.xz / sp : vec2(0.);
+          float back = clamp(-dot(wp.xz - a.xz, dir), 0., sp * 1.5);
+          vec2 d = wp.xz - (a.xz - dir * back); float L = length(d) + .001;
+          float k = (1. - smoothstep(a.w * .3, a.w * 1.3, L)) * (1. - smoothstep(a.w * .4, a.w * 1.6, abs(wp.y - a.y))) * (1. - back / (sp * 1.5 + .001)) * av.w;
+          push += d / L * k * min(a.w * .35, 1.6);
+        }
+        float pl = length(push); if (pl > 1.6) push *= 1.6 / pl;
+        float bend = smoothstep(0., 4., hm); push *= bend * bend;
+        wp.xz += push; wp.y -= dot(push, push) / (2. * max(hm, .5));
+        }
         }` : ''}
         vec4 mvPosition = viewMatrix * wp; gl_Position = projectionMatrix * mvPosition;`);
       // B — своё мягкое свечение: остальная флора острова нарисована без освещения, и освещённая под водой рядом с ней темнее
@@ -860,22 +918,58 @@ export class Visual {
         m.setColorAt(i, C.setRGB(...c)); i++;
       }
       m.count = i; m.frustumCulled = false; m.userData.n = i;
+      // v24: у качающихся видов — флаг «рядом зверь» на каждое растение и сетка 8 м для его поиска (см. _floraAvoid)
+      if (K.F) {
+        const near = new THREE.InstancedBufferAttribute(new Float32Array(K.n), 1); near.setUsage(THREE.DynamicDrawUsage); K.geo.setAttribute('aNear', near); m.userData.near = near;
+        const G = this._fGrid ||= [];
+        for (let j = 0; j < i; j++) { m.getMatrixAt(j, M); P.setFromMatrixPosition(M); const c = fCell(P.x) * FNG + fCell(P.z); (G[c] ||= []).push(this.flora.length, j, P.x, P.z); }
+      }
       this.scene.add(m); this.flora.push(m);
     }
   }
   // v23: точки, от которых расступается флора — ближайшие к камере звери в воде и стайки рыбок (центр и радиус тела)
-  _floraAvoid() {
+  // v24: у каждого зверя — сглаженная скорость (для следа) и сила: вошёл в число ближайших — сила плавно растёт, вышел —
+  // плавно гаснет (раньше растения рывком возвращались, когда зверь выпадал из десятки)
+  _floraAvoid(dt) {
     if (!this.uAvoid) return;
-    const cam = this.camera.position, L = this._avL ||= [];
+    const cam = this.camera.position, L = this._avL ||= [], T = this._avT ||= new Map(), AV = this.AVOID;
     L.length = 0;
     for (const o of this.agents.values()) {
       const fish = o.fish?.length, r = fish ? 5 : SWIM_R[o.sp] ? BODY_R[o.sp] || 2 : 0; if (!r) continue;
       const p = fish ? o.anchor : o.obj.position; if (p.y > .5) continue;   // над водой (птица, лев на берегу) — не задевает
-      L.push([p.distanceToSquared(cam), p.x, p.y, p.z, r]);
+      L.push([p.distanceToSquared(cam), p.x, p.y, p.z, r, o.id]);
     }
-    for (const s of this.shoals || []) { const x = s.c.x + Math.cos(s.a) * 5, z = s.c.z + Math.sin(s.a) * 5; L.push([(x - cam.x) ** 2 + (s.c.y - cam.y) ** 2 + (z - cam.z) ** 2, x, s.c.y, z, 2.5]); }
+    (this.shoals || []).forEach((s, i) => { const x = s.c.x + Math.cos(s.a) * 5, z = s.c.z + Math.sin(s.a) * 5; L.push([(x - cam.x) ** 2 + (s.c.y - cam.y) ** 2 + (z - cam.z) ** 2, x, s.c.y, z, 2.5, 's' + i]); });
     L.sort((a, b) => a[0] - b[0]);
-    this.uAvoid.value.forEach((v, i) => { const q = L[i]; if (q) v.set(q[1], q[2], q[3], q[4]); else v.set(0, -9999, 0, 1); });
+    const near = new Set(L.slice(0, AV).map(q => q[5])), kS = 1 - Math.exp(-dt / .5), kV = 1 - Math.exp(-dt / .4);
+    for (const q of L) {
+      let t = T.get(q[5]); if (!t) T.set(q[5], t = { x: q[1], z: q[3], vx: 0, vz: 0, s: 0 });
+      if (dt > 0) { t.vx += ((q[1] - t.x) / dt - t.vx) * kV; t.vz += ((q[3] - t.z) / dt - t.vz) * kV; }
+      t.x = q[1]; t.z = q[3]; t.y = q[2]; t.r = q[4]; t.seen = true;
+    }
+    for (const [id, t] of T) { t.s += ((near.has(id) && t.seen ? 1 : 0) - t.s) * kS; if (!t.seen && t.s < .01) T.delete(id); t.seen = false; }
+    const act = [...T.values()].filter(t => t.s > .01).sort((a, b) => b.s - a.s).slice(0, AV);
+    this.uAvoid.value.forEach((v, i) => { const t = act[i]; if (t) v.set(t.x, t.y, t.z, t.r); else v.set(0, -9999, 0, 1); });
+    this.uAvoidV.value.forEach((v, i) => { const t = act[i]; if (t) v.set(t.vx, (t.r * 1.3 + Math.hypot(t.vx, t.vz) * 1.5 + .01) ** 2, t.vz, t.s); else v.set(0, 0, 0, 0); });
+    this.uAvN.value = act.length;
+    // v24: растения, до которых может дотянуться зверь (тело ×1.3 + след + 2.5 м на качание и ширину куста), — флаг aNear:
+    // только у них вершинный шейдер считает расступание. Было: цикл по 10 зверям для всех ~860 тыс. вершин флоры —
+    // на телефоне ~7 мс кадра (?bench=2). Остальным вклад и так нулевой — вид тот же
+    const G = this._fGrid; if (!G) return;
+    const was = this._nearOn ||= [], dirty = new Set();
+    for (let q = 0; q < was.length; q += 2) { const a = this.flora[was[q]].userData.near; a.array[was[q + 1]] = 0; dirty.add(a); }
+    was.length = 0;
+    for (const t of act) {
+      const Rr = t.r * 1.3 + Math.hypot(t.vx, t.vz) * 1.5 + 2.5;
+      for (let cx = fCell(t.x - Rr); cx <= fCell(t.x + Rr); cx++) for (let cz = fCell(t.z - Rr); cz <= fCell(t.z + Rr); cz++) {
+        const L = G[cx * FNG + cz]; if (!L) continue;
+        for (let q = 0; q < L.length; q += 4) {
+          const dx = L[q + 2] - t.x, dz = L[q + 3] - t.z; if (dx * dx + dz * dz > Rr * Rr) continue;
+          const a = this.flora[L[q]].userData.near; if (!a.array[L[q + 1]]) { a.array[L[q + 1]] = 1; was.push(L[q], L[q + 1]); dirty.add(a); }
+        }
+      }
+    }
+    for (const a of dirty) a.needsUpdate = true;
   }
 
   // пена-крошка у кромки: каждая крупинка набегает от берега и откатывается с волной, растёт и тает
@@ -1014,12 +1108,18 @@ export class Visual {
   }
   _stepAmbient(dt, t) {
     const M = new THREE.Matrix4(), Q = new THREE.Quaternion(), P = new V3(), Sc = new V3(1, 1, 1), Z0 = new V3(), Y = new V3(0, 1, 0);
+    // v24: стайка вне кадра — не считаем её рыбок и не рисуем (466 рыбок каждый кадр — заметная доля JS на телефоне);
+    // положение рыбки — функция времени, вернувшись в кадр, стайка сразу на своём месте
+    const cam = this.camera; cam.updateMatrixWorld(); const F = this._frus ||= new THREE.Frustum(), Sp = this._frusS ||= new THREE.Sphere();
+    F.setFromProjectionMatrix(M.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse));
+    const seen = (s, x, y, z, r) => (s.m.visible = F.intersectsSphere(Sp.set(P.set(x, y, z), r)));
     this.panicT = Math.max(0, (this.panicT || 0) - dt);
     // рифовые рыбки: круги над грядой; при охоте акулы рядом — врассыпную
     for (const s of this.reefShoals) {
       s.a += s.sp * dt * .35;
       const scare = this.panicT > 0 && this.panicAt && Math.hypot(this.panicAt.x - s.c.x, this.panicAt.z - s.c.z) < 40 ? 1 : 0;
       const spread = 1 + scare * 2.2, cx = s.c.x + Math.cos(s.a) * 6, cz = s.c.z + Math.sin(s.a) * 4;
+      if (!seen(s, cx, s.c.y, cz, 3.5 * spread + 1)) continue;
       s.f.forEach(([x, y, z, ph], i) => {
         P.set(cx + x * spread + Math.sin(t * 1.6 + ph) * .4, s.c.y + y + Math.sin(t * 2.2 + ph) * .15, cz + z * spread + Math.cos(t * 1.4 + ph) * .4);
         // v21: над камнем рифа, но под водой; v22: и не в камне там, где гряда у самой поверхности (_fishInWater)
@@ -1044,6 +1144,7 @@ export class Visual {
     for (const s of this.farShoals) {   // дальние рыбы: спины у самой поверхности
       s.a += s.sp * dt * .2;
       const cx = s.c.x + Math.cos(s.a) * 12, cz = s.c.z + Math.sin(s.a) * 12, head = Math.atan2(-Math.sin(s.a) * s.sp, Math.cos(s.a) * s.sp);
+      if (!seen(s, cx, 0, cz, 7)) continue;
       s.f.forEach(([x, y, z, ph], i) => {
         P.set(cx + x + Math.sin(t * .9 + ph) * .5, .06 + Math.sin(t * 1.7 + ph) * .12, cz + z + Math.cos(t * .8 + ph) * .5);
         Q.setFromAxisAngle(Y, head + Math.sin(t * 3 + ph) * .2); M.compose(P, Q, this._h(P.x, P.z) < -.6 ? Sc : Z0); s.m.setMatrixAt(i, M);   // v22: над мелью — не видно
@@ -1054,6 +1155,7 @@ export class Visual {
       s.a += s.sp * dt * .25;
       const panic = this.panicT > 0 && this.panicAt && Math.hypot(this.panicAt.x - s.c.x, this.panicAt.z - s.c.z) < 45 ? 2.4 : 1;
       const cx = s.c.x + Math.cos(s.a) * 5, cz = s.c.z + Math.sin(s.a) * 5, head = Math.atan2(-Math.sin(s.a) * s.sp, Math.cos(s.a) * s.sp);   // v12: без +π/2 — плыли боком
+      if (!seen(s, cx, s.c.y, cz, 2.2 * panic + 1)) continue;
       s.f.forEach(([x, y, z, ph], i) => {
         P.set(cx + x * panic + Math.sin(t * 1.3 + ph) * .3, s.c.y + y + Math.sin(t * 2 + ph) * .1, cz + z * panic + Math.cos(t * 1.1 + ph) * .3);
         const wet = this._fishInWater(P, cx, cz, s.c);   // v22: стайки у берега заходили в склон острова (~30% рыбок)
@@ -1088,7 +1190,7 @@ export class Visual {
   // рельефом); изредка — цепочка муравьёв, жук, реже змейка. Ползут по рельефу, у воды разворачиваются
   _stepCrawlers(dt) {
     const cam = this.camera.position, tg = this.controls.target;
-    const near = (cam.distanceTo(tg) < 16 && cam.y - islandH(cam.x, cam.z) < 12 && islandH(tg.x, tg.z) > .4) || (this._crawlQA ??= new URLSearchParams(location.search).has('crawl'));
+    const near = (cam.distanceTo(tg) < 16 && cam.y - hq(cam.x, cam.z) < 12 && hq(tg.x, tg.z) > .4) || (this._crawlQA ??= new URLSearchParams(location.search).has('crawl'));
     const GAP = { ants: [18, 40], beetle: [9, 22], snake: [45, 100] }, MAX = { ants: 1, beetle: 3, snake: 1 };
     if (near) for (const k of Object.keys(GAP)) if ((this.crawlT[k] -= dt) <= 0) {
       this.crawlT[k] = rnd(...GAP[k]);
@@ -1098,7 +1200,7 @@ export class Visual {
     let n = 0;
     const put = (x, z, r, sx, sz, h, col, lift = 0) => {
       if (n >= 700) return;
-      P.set(x, islandH(x, z) + r * .7 + lift, z); Q.setFromAxisAngle(Y, h); S.set(sx, r, sz);
+      P.set(x, hq(x, z) + r * .7 + lift, z); Q.setFromAxisAngle(Y, h); S.set(sx, r, sz);
       M.compose(P, Q, S); this.crawlMesh.setMatrixAt(n, M); this.crawlMesh.setColorAt(n, C.setRGB(...col)); n++;
     };
     this.crawlers = this.crawlers.filter(c => {
@@ -1125,13 +1227,13 @@ export class Visual {
     if (c.kind === 'beetle' && Math.sin(c.t * .9 + c.ph) < -.3) return;   // жук то идёт, то замирает
     c.h += Math.sin(c.t * c.wf + c.ph) * c.turn * dt;
     const nx = c.x + Math.sin(c.h) * c.sp * dt, nz = c.z + Math.cos(c.h) * c.sp * dt;
-    if (islandH(nx, nz) < .45) c.h += Math.PI * rnd(.6, 1); else { c.x = nx; c.z = nz; }
+    if (hq(nx, nz) < .45) c.h += Math.PI * rnd(.6, 1); else { c.x = nx; c.z = nz; }
     const last = c.trail[0]; if (!last || Math.hypot(c.x - last[0], c.z - last[1]) > .04) { c.trail.unshift([c.x, c.z]); if (c.trail.length > c.keep) c.trail.pop(); }
   }
   _spawnCrawler(kind, near) {
     for (let i = 0; i < 12; i++) {
       const a = Math.random() * 6.2832, r = rnd(1.2, 6), x = near.x + Math.cos(a) * r, z = near.z + Math.sin(a) * r;
-      if (islandH(x, z) < .7) continue;
+      if (hq(x, z) < .7) continue;
       const pick = arr => arr[(Math.random() * arr.length) | 0];
       this.crawlers.push({ kind, x, z, h: Math.random() * 6.28, t: 0, ph: Math.random() * 6.28, trail: [],
         sp: { ants: .32, beetle: .22, snake: .5 }[kind], turn: { ants: 1.2, beetle: 1.5, snake: 3.2 }[kind], wf: { ants: .7, beetle: .9, snake: 2.6 }[kind],
@@ -1150,7 +1252,7 @@ export class Visual {
     const to = from.clone().add(new V3(rnd(-1.6, 1.6), 0, rnd(-1.6, 1.6))), life = .6; let t = 0;
     this.fx.push(dt => {
       t += dt; const u = clamp(t / life), a = g.attributes.position;
-      a.setXYZ(0, lerp(from.x, to.x, u), lerp(from.y, islandH(to.x, to.z), u) + .15 + Math.sin(u * Math.PI) * 1.1, lerp(from.z, to.z, u)); a.needsUpdate = true;
+      a.setXYZ(0, lerp(from.x, to.x, u), lerp(from.y, hq(to.x, to.z), u) + .15 + Math.sin(u * Math.PI) * 1.1, lerp(from.z, to.z, u)); a.needsUpdate = true;
       if (u >= 1) { this.scene.remove(pt); g.dispose(); m.dispose(); return false; } return true;
     });
   }
@@ -1174,7 +1276,7 @@ export class Visual {
       fragmentShader: `uniform float uK; varying vec3 vCol; varying float vA;
         void main() { float d = length(gl_PointCoord - .5); if (d > .5) discard; gl_FragColor = vec4(vCol, smoothstep(.5, .0, d) * vA * uK); }`,
     });
-    const pts = new THREE.Points(g, m); pts.frustumCulled = false; pts.renderOrder = order; this.scene.add(pts); m.userData.g = g; return m;
+    const pts = new THREE.Points(g, m); pts.frustumCulled = false; pts.renderOrder = order; this.scene.add(pts); m.userData.g = g; (this.glowPts ||= []).push(pts); return m;
   }
   _buildNightLife() {
     const sea = this.shallowPts, grass = this.grassPts;
@@ -1208,7 +1310,7 @@ export class Visual {
     }
     g.setAttribute('aC', new THREE.InstancedBufferAttribute(C, 3)); g.setAttribute('aD', new THREE.InstancedBufferAttribute(D, 4));
     this.mothMat = new THREE.ShaderMaterial({
-      transparent: true, depthWrite: false, side: THREE.DoubleSide,
+      transparent: true, depthWrite: false, side: THREE.DoubleSide, forceSinglePass: true,   // v24: плоские крылья — порядок сторон не важен
       uniforms: { uT: this.uT, uK: { value: 0 } },
       vertexShader: `uniform float uT, uK; attribute vec3 aC; attribute vec4 aD; varying float vT;
         void main() {
@@ -1222,7 +1324,7 @@ export class Visual {
       fragmentShader: `uniform float uK; varying float vT;
         void main() { gl_FragColor = vec4(mix(vec3(.95, .9, .78), vec3(.84, .8, 1.), vT), .75 * uK); }`,
     });
-    const m = new THREE.Mesh(g, this.mothMat); m.frustumCulled = false; this.scene.add(m); this.mothGeo = g; g.userData.n = n;
+    const m = new THREE.Mesh(g, this.mothMat); m.frustumCulled = false; this.scene.add(m); this.mothGeo = g; g.userData.n = n; this.mothMesh = m;
   }
 
   // светящиеся частицы в воздухе и над водой — слой «как у образца»; днём еле заметны, ночью мерцают
@@ -1314,7 +1416,11 @@ export class Visual {
           gl_FragColor = vec4(col, max(a, clamp(foam, 0., 1.)));
         }`,
     });
-    const water = new THREE.Mesh(new THREE.PlaneGeometry(10000, 10000), this.waterMat);
+    // v24: сетка 256×256 (клетки ~39 м), а не два треугольника 10×10 км — на огромных треугольниках глубина и мировые
+    // координаты точки считаются с погрешностью, и у пологих пляжей граница «вода спереди / песок спереди» дрожала при
+    // каждом сдвиге камеры (мерцание кромки); за камерой вода сдвигается целыми клетками — сетка стоит в мире
+    this.waterN = 256;
+    const water = new THREE.Mesh(new THREE.PlaneGeometry(10000, 10000, this.waterN, this.waterN), this.waterMat);
     water.rotation.x = -Math.PI / 2; this.scene.add(water); this.water = water;
     // v11: вода рисуется раньше всего прозрачного над ней (частицы, облака, брызги, светлячки). Раньше её план, будучи
     // «ближе всех» к камере, рисовался последним и закрашивал всё, за чем виднелась вода: стоило поднять камеру —
@@ -1436,7 +1542,7 @@ export class Visual {
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setAttribute('aS', new THREE.Float32BufferAttribute(aS, 1));
     g.setAttribute('aV', new THREE.Float32BufferAttribute(aV, 1)); g.setAttribute('aK', new THREE.Float32BufferAttribute(aK, 1)); g.setIndex(idx);
-    this.curMat = new THREE.ShaderMaterial({ transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false, side: THREE.DoubleSide,
+    this.curMat = new THREE.ShaderMaterial({ transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false, side: THREE.DoubleSide, forceSinglePass: true,
       uniforms: { uT: this.uT, uK: { value: 0 }, uC: { value: new THREE.Color() } },
       vertexShader: `attribute float aS, aV, aK; varying float vS, vV, vK; void main() { vS = aS; vV = aV; vK = aK; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.); }`,
       fragmentShader: `uniform float uT, uK; uniform vec3 uC; varying float vS, vV, vK;
@@ -1477,6 +1583,16 @@ export class Visual {
   // обесцвечиваются и тонируются в один мягкий цвет вида, по краю — светящийся контур (ночью ярче).
   // Все материалы → Lambert, одна стилистика для CC0 и CC-BY моделей. GLTFLoader отдаёт линейные цвета,
   // а вывод у нас без sRGB — поэтому convertLinearToSRGB, иначе всё темнее задуманного.
+  // v24: текстуры моделей — не больше 1024 точек («Лёгкое» — 256). У звезды, осьминога, пеликана и льва были по 2048: одна
+  // такая — ~21 МБ видеопамяти, а цвет текстуры у нас всё равно приглушён тоном вида и рисуется гранями (flatShading)
+  _fitTex(t) {
+    const im = t.image, cap = this.lite ? 256 : 1024;
+    if (!im || !(Math.max(im.width, im.height) > cap)) return;
+    const k = cap / Math.max(im.width, im.height), c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(im.width * k)); c.height = Math.max(1, Math.round(im.height * k));
+    c.getContext('2d').drawImage(im, 0, 0, c.width, c.height); im.close?.();
+    t.image = c; t.needsUpdate = true;
+  }
   _restyle(root, tint, rim, keep = .25) {
     const uTint = { value: new THREE.Color(tint) }, uRim = { value: new THREE.Color(rim) }, uKeep = { value: keep }, uRimK = this.uRimK;
     root.traverse(n => {
@@ -1484,7 +1600,7 @@ export class Visual {
       const src = Array.isArray(n.material) ? n.material : [n.material];
       const out = src.map(m => {
         const c = (m.color || new THREE.Color(1, 1, 1)).clone().convertLinearToSRGB();
-        if (m.map) m.map.colorSpace = THREE.NoColorSpace;
+        if (m.map) { m.map.colorSpace = THREE.NoColorSpace; this._fitTex(m.map); }
         const mat = new THREE.MeshLambertMaterial({ color: c, map: m.map || null, vertexColors: !!n.geometry.attributes.color, flatShading: true });
         this._hook(mat, sh => {
           Object.assign(sh.uniforms, { uTint, uRim, uKeep, uRimK });
@@ -1500,13 +1616,70 @@ export class Visual {
       n.material = Array.isArray(n.material) ? out : out[0];
     });
   }
+  // v24: ход загрузки (экран входа и ?debug=1), у каждой модели — предел 30 с (не пришла — мир без неё, вход не ждёт);
+  // в «Лёгком» акула и косатка — при первом появлении (_lazyModel)
   async _loadAssets() {
-    const loader = new GLTFLoader();
-    const load = url => new Promise((res, rej) => loader.load(url, res, undefined, rej));
     const names = ['dolphin', 'whale', 'fish', 'shark', 'orca', 'gull', 'gull_dark', 'pelican', 'sea_lion', 'palm_1', 'palm_2', 'palm_3',
-      'jellyfish', 'octopus', 'starfish', 'crab', 'turtle', 'shrimp', 'stingray'];
-    const got = await Promise.all(names.map(n => load(`./models/${n}.glb`).catch(e => { console.error(n, e); return null; })));
-    const A = {};
+      'jellyfish', 'octopus', 'starfish', 'crab', 'turtle', 'shrimp', 'stingray'].filter(n => !(this.lite && LAZY.has(n)));
+    const ms = step('модели'); let n = 0, bad = 0;
+    const got = await Promise.all(names.map(nm => this._fetchModel(nm).then(g => { ms.note(`${++n} из ${names.length}`); return g; },
+      e => { bad++; console.error(nm, e); ms.note(`${++n} из ${names.length}`); return null; })));
+    ms.done(!bad, bad ? `не пришло: ${bad}` : '');
+    this.assets = {};
+    names.forEach((nm, i) => { if (got[i]) this._prepModel(nm, got[i]); });
+    this._plantPalms();
+    for (const o of this.agents.values()) this._attachModel(o);
+    this._warmUp();
+    // v19: сетки обхода мели (navGrid, ~30 мс каждая на ПК) — заранее, по одной за раз, а не рывком посреди просмотра
+    Object.keys(ORB).forEach((sp, i) => setTimeout(() => navGrid(SWIM_DEPTH[sp], ORB[sp]), 1500 + i * 400));
+  }
+  _fetchModel(n) { this._gltf ??= new GLTFLoader(); return within(new Promise((res, rej) => this._gltf.load(`./models/${n}.glb`, res, undefined, rej)), 30000, n); }
+  // v24: редкий гость в «Лёгком» — модель грузится при первом появлении, шейдер собирается до показа
+  _lazyModel(n) {
+    (this._lazy ??= {})[n] ??= this._fetchModel(n).then(g => {
+      this._prepModel(n, g);
+      const probe = this._clone(n); probe.obj.position.y = -500;
+      return this.renderer.compileAsync(probe.obj, this.camera, this.scene).catch(() => {});
+    }).then(() => { for (const o of this.agents.values()) if (!o.attached) this._attachModel(o); })
+      .catch(e => { console.warn('модель', n, e?.message || e); delete this._lazy[n]; });
+  }
+  // v24: креветка — 34 куска с одинаковым материалом → один: рой из 12 креветок рисовался 408 вызовами отрисовки (два роя —
+  // 816 из ~920 на кадр: больше всего времени и процессора, и видеокарты). Вид тот же
+  _mergeModel(root) {
+    root.updateMatrixWorld(true); const gs = [], ms = [];
+    root.traverse(m => { if (!m.isMesh) return; const g = m.geometry.clone().applyMatrix4(m.matrixWorld);
+      for (const k of Object.keys(g.attributes)) if (k !== 'position' && k !== 'normal') g.deleteAttribute(k); gs.push(g); ms.push(m); });
+    if (gs.length < 2) return;
+    const mesh = new THREE.Mesh(mergeGeometries(gs.every(g => g.index) ? gs : gs.map(g => g.index ? g.toNonIndexed() : g)), ms[0].material);
+    for (const m of ms) m.removeFromParent(); root.add(mesh);
+  }
+  // v24: части модели с одним скелетом (или без него), одним положением и без текстур — в один меш; цвет части уходит в
+  // цвет вершин (_restyle берёт его вместо цвета материала — вид тот же). Вызовов отрисовки и обновлений скелета меньше:
+  // у косяка 16 рыб × 3 части = 48 → 16, у дельфина 2 → 1
+  _mergeParts(root) {
+    root.updateMatrixWorld(true); const groups = new Map();
+    root.traverse(m => { if (!m.isMesh || Array.isArray(m.material) || m.material.map || m.morphTargetInfluences) return;
+      const k = (m.skeleton?.uuid || '-') + '|' + m.matrixWorld.elements.map(x => x.toFixed(5)).join(',') + '|' + m.material.transparent + m.material.opacity + m.material.side;
+      if (!groups.has(k)) groups.set(k, []); groups.get(k).push(m); });
+    const KEEP = ['position', 'normal', 'color', 'skinIndex', 'skinWeight'];
+    for (const ms of groups.values()) {
+      if (ms.length < 2) continue;
+      const gs = ms.map(m => { const g = m.geometry.clone(), n = g.attributes.position.count, c = m.material.color.clone().convertLinearToSRGB(), old = g.attributes.color, col = new Float32Array(n * 3);
+        for (let i = 0; i < n; i++) col.set([c.r * (old ? old.getX(i) : 1), c.g * (old ? old.getY(i) : 1), c.b * (old ? old.getZ(i) : 1)], i * 3);
+        g.setAttribute('color', new THREE.BufferAttribute(col, 3)); if (!g.attributes.normal) g.computeVertexNormals();
+        for (const k of Object.keys(g.attributes)) if (!KEEP.includes(k)) g.deleteAttribute(k);
+        for (const k of Object.keys(g.morphAttributes)) delete g.morphAttributes[k];
+        return g; });
+      const geo = mergeGeometries(gs.every(g => g.index) ? gs : gs.map(g => g.index ? g.toNonIndexed() : g)); if (!geo) continue;
+      const a = ms[0], mat = a.material.clone(); mat.color.setRGB(1, 1, 1);
+      const mesh = a.isSkinnedMesh ? new THREE.SkinnedMesh(geo, mat) : new THREE.Mesh(geo, mat);
+      mesh.name = a.name; mesh.position.copy(a.position); mesh.quaternion.copy(a.quaternion); mesh.scale.copy(a.scale); a.parent.add(mesh);
+      if (a.isSkinnedMesh) mesh.bind(a.skeleton, a.bindMatrix);
+      for (const m of ms) m.removeFromParent();
+    }
+  }
+  _prepModel(n, g) {
+    const A = this.assets;
     // size — длина по самой длинной горизонтальной оси; yaw — поворот, чтобы голова смотрела в +z; base — низ на 0 (стоящие)
     // ponytail: животные крупнее реального (дельфин 5 м) — иначе рядом с 60-метровым островом их не разглядеть
     const spec = { dolphin: [5, 0], whale: [20, 0], fish: [1.2, 0], shark: [7, 0], orca: [9, 0], gull: [3.4, -Math.PI / 2], gull_dark: [3.2, -Math.PI / 2],
@@ -1521,14 +1694,20 @@ export class Visual {
       palm_1: ['#b4bf9c', '#dfe8cc', .45], palm_2: ['#b4bf9c', '#dfe8cc', .45], palm_3: ['#b4bf9c', '#dfe8cc', .45],
       jellyfish: ['#ff8ad8', '#ffc6f2', .7], octopus: ['#e58a7c', '#ffc9b5', .5], starfish: ['#f0a27e', '#ffd7bd', .55], crab: ['#e5805f', '#ffc8a8', .5],
       turtle: ['#a6c48f', '#e4ffcf', .45], shrimp: ['#ffb9aa', '#ffe6de', .45], stingray: ['#8ea4bc', '#cfe7ff', .3] };
-    names.forEach((n, i) => {
-      const g = got[i]; if (!g) return;
-      const root = g.scene; this._restyle(root, ...TONE[n]);
+    {
+      const root = g.scene;
+      if (n === 'shrimp') this._mergeModel(root); else if (n !== 'jellyfish') this._mergeParts(root);   // у медузы свечение берётся из цвета части
+      this._restyle(root, ...TONE[n]);
       // медуза — неоновая: светится сама своим цветом и полупрозрачна; рисуется до воды (renderOrder), вода её подкрашивает
       // креветки роя — тоже с неоновым свечением (иначе мелкие бледные фигурки у дна не разглядеть)
       if (n === 'shrimp') root.traverse(m => { if (m.isMesh) for (const mt of [m.material].flat()) mt.emissive.set(0xff7a6a).multiplyScalar(.55); });
-      if (n === 'jellyfish') root.traverse(m => { if (!m.isMesh) return; m.renderOrder = -.8;
-        for (const mt of [m.material].flat()) { mt.emissive.set(0xff3fc0).lerp(mt.color, .25).multiplyScalar(.7); mt.transparent = true; mt.opacity = .82; mt.depthWrite = false; mt.side = THREE.DoubleSide; } });
+      // v24: изнанка — отдельная копия меша (рисуется раньше лица). Прозрачное двустороннее three.js рисует в два прохода и
+      // каждый раз заново выбирает шейдер (needsUpdate) — на телефоне это было дороже всех остальных зверей вместе
+      if (n === 'jellyfish') { const ms = []; root.traverse(m => m.isMesh && ms.push(m)); for (const m of ms) { m.renderOrder = -.8;
+        for (const mt of [m.material].flat()) { mt.emissive.set(0xff3fc0).lerp(mt.color, .25).multiplyScalar(.7); mt.transparent = true; mt.opacity = .82; mt.depthWrite = false; mt.side = THREE.FrontSide; }
+        const back = new THREE.Mesh(m.geometry, [m.material].flat().map(mt => { const b = mt.clone(); b.onBeforeCompile = mt.onBeforeCompile; b.customProgramCacheKey = mt.customProgramCacheKey; b.side = THREE.BackSide; return b; }));
+        if (!Array.isArray(m.material)) back.material = back.material[0];
+        back.renderOrder = -.801; m.add(back); } }
       if (n.startsWith('gull')) {   // переносим геометрию в систему модели: крылья вдоль z, изгиб в _makeFlap считается в ней
         root.updateMatrixWorld(true); const ms = []; root.traverse(m => m.isMesh && ms.push(m));
         for (const m of ms) { m.geometry = m.geometry.clone().applyMatrix4(m.matrixWorld); m.removeFromParent(); m.position.set(0, 0, 0); m.rotation.set(0, 0, 0); m.scale.set(1, 1, 1); root.add(m); }
@@ -1540,13 +1719,7 @@ export class Visual {
       const inner = new THREE.Group(); inner.add(root); inner.scale.setScalar(s); holder.add(inner);
       holder.updateMatrixWorld(true);   // box — рамка в системе модели (голова +z), нужна процедурной анимации
       A[n] = { obj: holder, clips: g.animations, span: size.z * s, h: size.y * s, box: new THREE.Box3().setFromObject(holder, true) };
-    });
-    this.assets = A;
-    this._plantPalms();
-    for (const o of this.agents.values()) this._attachModel(o);
-    this._warmUp();
-    // v19: сетки обхода мели (navGrid, ~30 мс каждая на ПК) — заранее, по одной за раз, а не рывком посреди просмотра
-    Object.keys(ORB).forEach((sp, i) => setTimeout(() => navGrid(SWIM_DEPTH[sp], ORB[sp]), 1500 + i * 400));
+    }
   }
   // v22: фризы раз в несколько секунд (замер: qa/perf_profile.mjs) — сборка шейдеров посреди игры. Каждый вид зверя
   // при первом появлении и каждый эффект (круги на воде, брызги, дым, прыжок кузнечика) собирали шейдер, и кадр ждал
@@ -1557,7 +1730,7 @@ export class Visual {
   _warmUp() {
     const warm = this.warm = new THREE.Group(), at = new V3(0, -500, 0);
     const SP = ['seagull', 'tern', 'albatross', 'cormorant', 'pelican', 'dolphin', 'whale', 'shark', 'orca', 'sea_lion', 'sea_turtle',
-      'shrimp_swarm', 'jellyfish', 'octopus', 'starfish', 'crab', 'stingray', 'fish_school'];
+      'shrimp_swarm', 'jellyfish', 'octopus', 'starfish', 'crab', 'stingray', 'fish_school'].filter(sp => !(this.lite && LAZY.has(sp)));
     SP.forEach((sp, i) => {
       const o = { id: -1 - i, sp, n: 0, seed: 1, t: 0, obj: new THREE.Group(), mixers: [], heading: 0 };
       this._attachModel(o);
@@ -1572,23 +1745,34 @@ export class Visual {
     warm.add(new THREE.Points(pts, new THREE.PointsMaterial({ color: 0xffffff, size: .6, transparent: true, opacity: .95, depthWrite: false, map: this.glowTex })));
     warm.add(new THREE.Points(pts, new THREE.PointsMaterial({ color: 0xffffff, size: 3.2, sizeAttenuation: true, transparent: true, depthWrite: false, fog: false, map: this.glowTex, opacity: 0 })));
     warm.add(new THREE.Points(pts, new THREE.PointsMaterial({ color: 0xc8e86a, size: .14, sizeAttenuation: true, transparent: true })));
-    warm.add(new THREE.Mesh(new THREE.PlaneGeometry(1.5, .5), new THREE.MeshLambertMaterial({ color: 0xbfe8ff, emissive: 0x2a4a5a, transparent: true, opacity: .75, side: THREE.DoubleSide })));
+    warm.add(new THREE.Mesh(new THREE.PlaneGeometry(1.5, .5), new THREE.MeshLambertMaterial({ color: 0xbfe8ff, emissive: 0x2a4a5a, transparent: true, opacity: .75, side: THREE.DoubleSide, forceSinglePass: true })));
     const fish = this._clone('fish'); if (fish) warm.add(fish.obj);
     seededRandom(2311, () => { const k = this._hatchKit(), m = new THREE.InstancedMesh(k.geo, k.mat, 1); m.setColorAt(0, new THREE.Color(1, 1, 1)); warm.add(m); });   // v23: черепашата (и three.js берёт Math.random на id объектов)
     warm.traverse(n => { n.frustumCulled = false; });
     warm.position.copy(at); warm.updateMatrixWorld(true);
-    const t0 = performance.now(), rt = this.renderer.getRenderTarget();
-    this.renderer.setRenderTarget(this.rt);   // как в кадре: сцена рисуется в буфер this.rt
-    const done = this.renderer.compileAsync(warm, this.camera, this.scene);
-    this.renderer.setRenderTarget(rt);
-    // без параллельной сборки (KHR_parallel_shader_compile) браузер доделывает шейдер при первой отрисовке — рисуем
-    // образцы один раз в буфер 1×1 вместе со сценой (тот же свет и туман, значит те же шейдеры), пока открыт вход
-    done.then(() => {
-      const tiny = new THREE.WebGLRenderTarget(1, 1), prev = this.renderer.getRenderTarget();
-      this.scene.add(warm); this.renderer.setRenderTarget(tiny); this.renderer.render(this.scene, this.camera);
-      this.renderer.setRenderTarget(prev); this.scene.remove(warm); tiny.dispose();
-      if (new URLSearchParams(location.search).has('debug')) console.info(`[warm] шейдеры собраны за ${(performance.now() - t0).toFixed(0)} мс`);
-    }).catch(e => console.warn('прогрев шейдеров:', e));
+    // v24: частями по 4 образца с паузой — на слабом телефоне сборка всех ~30 шейдеров разом стояла секундами одним куском
+    // (и вместе с распаковкой звука давала пик памяти). Сборка видит только видимое — части включаются по очереди
+    const t0 = performance.now(), kids = warm.children.slice(), N = 4, ws = step('шейдеры'); let i = 0;
+    const part = () => {
+      if (i >= kids.length || this.lost) {
+        for (const k of kids) k.visible = true; ws.done(i >= kids.length, this.lost ? 'контекст потерян' : '');
+        if (new URLSearchParams(location.search).has('debug')) console.info(`[warm] шейдеры собраны за ${(performance.now() - t0).toFixed(0)} мс`);
+        return;
+      }
+      kids.forEach((k, j) => { k.visible = j >= i && j < i + N; });
+      const rt = this.renderer.getRenderTarget();
+      this.renderer.setRenderTarget(this.rt);   // как в кадре: сцена рисуется в буфер this.rt
+      const done = this.renderer.compileAsync(warm, this.camera, this.scene);
+      this.renderer.setRenderTarget(rt);
+      // без параллельной сборки (KHR_parallel_shader_compile) браузер доделывает шейдер при первой отрисовке — рисуем
+      // образцы один раз в буфер 1×1 вместе со сценой (тот же свет и туман, значит те же шейдеры), пока открыт вход
+      done.then(() => {
+        const tiny = new THREE.WebGLRenderTarget(1, 1), prev = this.renderer.getRenderTarget();
+        this.scene.add(warm); this.renderer.setRenderTarget(tiny); this.renderer.render(this.scene, this.camera);
+        this.renderer.setRenderTarget(prev); this.scene.remove(warm); tiny.dispose();
+      }).catch(e => console.warn('прогрев шейдеров:', e)).then(() => { i += N; ws.note(`${Math.min(i, kids.length)} из ${kids.length}`); setTimeout(part, 16); });
+    };
+    part();
   }
   _clone(name) {
     const a = this.assets?.[name]; if (!a) return null;
@@ -1601,14 +1785,32 @@ export class Visual {
     return { obj, mixer };
   }
 
+  // v24: пальмы одного вида — одна InstancedMesh на часть модели (было 16 копий — 16 вызовов отрисовки); качание —
+  // матрица экземпляра каждый кадр (_swayPalms). Точечная фактура считает масштаб с матрицей экземпляра — как у копии
   _plantPalms() {
-    const pts = this.grassPts.filter(p => p.y > 1.3 && p.y < 4.5);
+    const pts = this.grassPts.filter(p => p.y > 1.3 && p.y < 4.5), by = [[], [], []];
     for (let i = 0; i < 16 && pts.length; i++) {
       const p = pts.splice((Math.random() * pts.length) | 0, 1)[0];
-      const m = this._clone(`palm_${1 + (i % 3)}`); if (!m) continue;
-      m.obj.position.copy(p).setY(p.y - .2); m.obj.rotation.y = Math.random() * 6.28; m.obj.scale.setScalar(rnd(.8, 1.15));
-      m.obj.userData.seed = Math.random() * 10; this.scene.add(m.obj); (this.palms ||= []).push(m.obj);
+      by[i % 3].push({ p: p.clone().setY(p.y - .2), ry: Math.random() * 6.28, sc: rnd(.8, 1.15), seed: Math.random() * 10 });
     }
+    this.palms = [];
+    by.forEach((list, k) => {
+      const a = this.assets[`palm_${k + 1}`]; if (!a || !list.length) return;
+      a.obj.updateMatrixWorld(true);
+      a.obj.traverse(n => {
+        if (!n.isMesh) return;
+        const mat = [n.material].flat().map(mt => this._hook(Object.assign(mt.clone(), { onBeforeCompile: mt.onBeforeCompile, customProgramCacheKey: mt.customProgramCacheKey }),
+          sh => { sh.vertexShader = sh.vertexShader.replace('vSP = transformed * length(modelMatrix[0].xyz);', 'vSP = transformed * length((modelMatrix * instanceMatrix)[0].xyz);'); }, 'stInst'));
+        const m = new THREE.InstancedMesh(n.geometry, Array.isArray(n.material) ? mat : mat[0], list.length);
+        m.userData = { list, B: n.matrixWorld.clone() }; this._swayPalms(m, 0); m.computeBoundingSphere(); m.boundingSphere.radius += 2;
+        this.scene.add(m); this.palms.push(m);
+      });
+    });
+  }
+  _swayPalms(m, t) {
+    const { list, B } = m.userData, M = this._pM ||= new THREE.Matrix4(), E = this._pE ||= new THREE.Euler(), Q = this._pQ ||= new THREE.Quaternion(), S = this._pS ||= new V3();
+    list.forEach((q, j) => { E.set(0, q.ry, Math.sin(t * (.8 + this.cur.wind) + q.seed) * (.01 + this.cur.wind * .03)); M.compose(q.p, Q.setFromEuler(E), S.setScalar(q.sc)).multiply(B); m.setMatrixAt(j, M); });
+    m.instanceMatrix.needsUpdate = true;
   }
 
   // ------------------------------------------------------------------ данные
@@ -1739,6 +1941,7 @@ export class Visual {
   }
   _attachModel(o) {
     if (!this.assets || o.attached) return;
+    if (LAZY.has(o.sp) && !this.assets[o.sp]) { if (this.lite && o.id >= 0) this._lazyModel(o.sp); return; }   // v24: «Лёгкое» — модель придёт при первом появлении
     const add = name => { const m = this._clone(name); if (!m) return null; o.obj.add(m.obj); if (m.mixer) o.mixers.push(m.mixer); return m.obj; };
     if (o.sp === 'fish_school') {
       o.fish = [];
@@ -1760,8 +1963,19 @@ export class Visual {
     else if (o.sp === 'sea_lion') o.model = add('sea_lion');
     else if (o.sp === 'sea_turtle') o.model = add('turtle');
     else if (o.sp === 'shrimp_swarm') {   // рой: дюжина креветок вокруг общей точки
-      o.shrimp = [];
-      for (let i = 0; i < 12; i++) { const m = add('shrimp'); if (!m) break; this._wiggle(o, 'shrimp', 'shrimp', m); o.shrimp.push({ m, off: new V3(rnd(-1.3, 1.3), rnd(-.4, .4), rnd(-1.3, 1.3)), ph: Math.random() * 6.28 }); }
+      // v24: одна InstancedMesh на рой (было 12 копий модели — 12 вызовов отрисовки на рой). Вид тот же: креветки и раньше
+      // были одной формы и шевелились в такт (общие o.wig). Масштаб модели — у самой InstancedMesh: точечная фактура
+      // берёт его из modelMatrix, как у копии модели
+      const m = add('shrimp'); let mesh = null; m?.traverse(n => { if (n.isMesh) mesh ||= n; });
+      if (mesh) {
+        this._wiggle(o, 'shrimp', 'shrimp', m); m.updateMatrixWorld(true);
+        const sc = this.assets.shrimp.obj.children[0].scale.x, rest = m.matrixWorld.clone().invert().multiply(mesh.matrixWorld).premultiply(new THREE.Matrix4().makeScale(1 / sc, 1 / sc, 1 / sc));
+        const inst = new THREE.InstancedMesh(mesh.geometry, mesh.material, 12); inst.scale.setScalar(sc);
+        inst.boundingSphere = new THREE.Sphere(new V3(), 4.5 / sc);   // весь рой (с разлётом при испуге) — для отсечения вне кадра
+        m.removeFromParent(); o.obj.add(inst);
+        o.shrimpI = { inst, rest, sc };
+        o.shrimp = Array.from({ length: 12 }, () => ({ p: new V3(), ry: 0, off: new V3(rnd(-1.3, 1.3), rnd(-.4, .4), rnd(-1.3, 1.3)), ph: Math.random() * 6.28 }));
+      }
     } else if (['jellyfish', 'octopus', 'starfish', 'crab', 'stingray'].includes(o.sp)) o.model = add(o.sp);
     if (o.model && BIRDS.has(o.sp) && o.sp !== 'pelican') this._makeFlap(o);
     if (o.model && WIG[o.sp]) this._wiggle(o, ...WIG[o.sp]);
@@ -1973,8 +2187,8 @@ export class Visual {
         return d >= FLEE_R ? own : new V3(qp.x + dx / d * FLEE_R, own.y, qp.z + dz / d * FLEE_R);
       }
       const a = o.seed * 2.1, rr = REL_R[o.sp] ?? 0, x = qp.x + Math.cos(a) * rr, z = qp.z + Math.sin(a) * rr;
-      if (o.sp === 'crab') return islandH(x, z) < 0 ? own : new V3(x, groundAt(x, z, .3), z);   // в воду не идёт
-      if (o.sp === 'octopus') { const g = islandH(x, z); return g > -.3 ? own : new V3(x, g + .1, z); }   // на сушу не вылезает
+      if (o.sp === 'crab') return hq(x, z) < 0 ? own : new V3(x, groundAt(x, z, .3), z);   // в воду не идёт
+      if (o.sp === 'octopus') { const g = hq(x, z); return g > -.3 ? own : new V3(x, g + .1, z); }   // на сушу не вылезает
       return new V3(x, own.y, z);
     }
     if (o.sp === 'ship') { const th = o.th0 + o.thDir * o.t * .0048; return new V3(Math.cos(th) * 1450, 0, Math.sin(th) * 1450); }
@@ -1984,7 +2198,7 @@ export class Visual {
       const e = shoreAt(o.site, o.x * Math.PI + o.site * 1.7);
       if (o.st === 'away' || o.st === 'leave') { const k = o.st === 'leave' ? 45 : 8; return deepSpot(new V3(e.x + e.dx * k, -.6, e.z + e.dz * k), -1.5, 1.5); }
       let x = e.x - e.dx * 1.6, z = e.z - e.dz * 1.6;
-      const c = siteOf(o.site); for (let i = 0; i < 12 && islandH(x, z) < .3; i++) { x += (c.cx - x) * .08; z += (c.cz - z) * .08; }   // v19: как у краба
+      const c = siteOf(o.site); for (let i = 0; i < 12 && hq(x, z) < .3; i++) { x += (c.cx - x) * .08; z += (c.cz - z) * .08; }   // v19: как у краба
       return new V3(x, groundAt(x, z, 1.2), z);
     }
     // краб — на мокром песке у кромки, морская звезда — на мелководье сразу за ней (видна сквозь воду)
@@ -1992,7 +2206,7 @@ export class Visual {
       const e = shoreAt(o.site, o.x * Math.PI + o.site * 2.3 + o.seed * .2, .25), k = o.sp === 'crab' ? -.7 : .9;
       let x = e.x + e.dx * k, z = e.z + e.dz * k;
       // v19: на маленьких неровных островках точка «чуть выше кромки» бывала в воде — краба сдвигаем вглубь суши
-      if (o.sp === 'crab') { const c = siteOf(o.site); for (let i = 0; i < 12 && islandH(x, z) < .15; i++) { x += (c.cx - x) * .08; z += (c.cz - z) * .08; } }
+      if (o.sp === 'crab') { const c = siteOf(o.site); for (let i = 0; i < 12 && hq(x, z) < .15; i++) { x += (c.cx - x) * .08; z += (c.cz - z) * .08; } }
       return new V3(x, groundAt(x, z, .3) - (o.st === 'hide' ? .6 : 0), z);   // краб в норке — под песком
     }
     // креветки и осьминог: риф (site 0) или отмели островков; у дна
@@ -2000,15 +2214,15 @@ export class Visual {
       let x, z;
       if (o.site === 0) {
         const a = o.x * REEF.half; let r = REEF.r + Math.sin(o.seed * 3) * REEF.width * .6;
-        for (let i = 0; i < 12 && islandH(Math.sin(a) * r, Math.cos(a) * r) > -1.2; i++) r += (i % 2 ? -1 : 1) * (i + 1) * .8;   // v19: гребень рифа бывает над водой
+        for (let i = 0; i < 12 && hq(Math.sin(a) * r, Math.cos(a) * r) > -1.2; i++) r += (i % 2 ? -1 : 1) * (i + 1) * .8;   // v19: гребень рифа бывает над водой
         x = Math.sin(a) * r; z = Math.cos(a) * r;
       }
       else ({ x, z } = shoreAt(o.site, o.x * Math.PI + o.seed, -2.5));
-      return new V3(x, islandH(x, z) + (o.sp === 'shrimp_swarm' ? 1.2 : .1), z);
+      return new V3(x, hq(x, z) + (o.sp === 'shrimp_swarm' ? 1.2 : .1), z);
     }
     // v19: черепаха греется на пляже главного острова / спит под уступом рифа; медуза, выброшенная штормом, — на песке
     if (o.sp === 'sea_turtle' && o.st === 'bask') { const e = shoreAt(0, o.ang0, .25), x = e.x - e.dx * 1.2, z = e.z - e.dz * 1.2; return new V3(x, groundAt(x, z, .6) + .15, z); }
-    if (o.sp === 'sea_turtle' && o.st === 'sleep') { const a = Math.sin(o.seed * 5) * REEF.half, r = REEF.r; return new V3(Math.sin(a) * r, islandH(Math.sin(a) * r, Math.cos(a) * r) + .6, Math.cos(a) * r); }
+    if (o.sp === 'sea_turtle' && o.st === 'sleep') { const a = Math.sin(o.seed * 5) * REEF.half, r = REEF.r; return new V3(Math.sin(a) * r, hq(Math.sin(a) * r, Math.cos(a) * r) + .6, Math.cos(a) * r); }
     if (o.sp === 'jellyfish' && o.st === 'stranded') {
       // v21: на сухом песке в ~1.5 м от кромки (лежала прямо на границе воды)
       const e = shoreAt(o.site, o.x * Math.PI + o.site * 2.3 + o.seed * .2, .25), x = e.x - e.dx * 1.5, z = e.z - e.dz * 1.5;
@@ -2017,8 +2231,8 @@ export class Visual {
     // скат — над песчаной отмелью главного острова, у дна
     if (o.sp === 'stingray') {
       const e = shoreAt(0, o.ang0 + o.x * .9, -1.5); let k = 2 + o.d * 14, x = e.x + e.dx * k, z = e.z + e.dz * k;
-      while (k > 0 && islandH(x, z) > -.8) { k -= 1; x = e.x + e.dx * k; z = e.z + e.dz * k; }   // v19: за отмелью бывает островок
-      return new V3(x, Math.min(-.7, islandH(x, z) + .8), z);
+      while (k > 0 && hq(x, z) > -.8) { k -= 1; x = e.x + e.dx * k; z = e.z + e.dz * k; }   // v19: за отмелью бывает островок
+      return new V3(x, Math.min(-.7, hq(x, z) + .8), z);
     }
     const a = o.ang0 + o.x * .9, d = BIRDS.has(o.sp) ? (o.sp === 'pelican' ? o.d * .3 : o.d * .5) : o.d, r = R + 5 + d * 45;
     // медуза: ночью ближе к поверхности, днём глубже (суточная вертикальная миграция планктона, v14)
@@ -2031,7 +2245,7 @@ export class Visual {
     const a = (this.podRun?.[o.sp] ?? 0) + (this.podPh?.[o.sp] ?? 0) - b * B / r;
     // v19: место в строю попало на мель (у островка) — подтягиваемся к точке стаи, она на глубине (косатка заходила на островок)
     const need = SWIM_DEPTH[o.sp] * .5; let k = 1, x, z;
-    do { x = base.x + Math.cos(a) * r * k; z = base.z + Math.sin(a) * r * k; k -= .125; } while (k > .5 && islandH(x, z) > need);
+    do { x = base.x + Math.cos(a) * r * k; z = base.z + Math.sin(a) * r * k; k -= .125; } while (k > .5 && hq(x, z) > need);
     return new V3(x, base.y, z);
   }
 
@@ -2104,7 +2318,7 @@ export class Visual {
       // v12: прилетает и улетает по воздуху (на своих крыльях, _pelicanWings), на месте садится на воду; на воде
       // покачивается, иногда окунает клюв и потягивает крылья; на «нырок» (событие) — зачерпывает рыбу клювом
       // v19: над сушей — только в полёте, и взлетает быстрее, чем садится (после нырка «скользил» низко над пляжем)
-      const fly = dl > 2 || o.gone || islandH(ob.position.x, ob.position.z) > -.8;
+      const fly = dl > 2 || o.gone || hq(ob.position.x, ob.position.z) > -.8;
       o.fly = lerp(o.fly ?? (fly ? 1 : 0), fly ? 1 : 0, 1 - Math.exp(-dt * (fly ? 2.5 : .8)));
       const sink = -(this.assets?.pelican?.h ?? 3) * .42;   // сидит в воде по брюхо — лап не видно (было: «ходит по воде»)
       const p = base.clone().add(new V3(Math.cos(o.t * .1 + o.seed) * 3, sink + Math.sin(o.t * 1.3) * .08, Math.sin(o.t * .1 + o.seed) * 3));
@@ -2223,7 +2437,7 @@ export class Visual {
         o.wig.b.value = claws ? Math.PI / 2 : o.wig.b.value + dt * (act('snap', 3) || act('drum', 3) ? 14 : 2.3); }
       const p = base.clone().addScaledVector(side, run);
       if (o.landOff) p.add(o.landOff);   // v21: отодвинут соседями
-      if (islandH(p.x, p.z) < .1) { p.copy(base); o.landOff?.multiplyScalar(.9); }   // v19: пробежка вдоль кромки не заходит в воду
+      if (hq(p.x, p.z) < .1) { p.copy(base); o.landOff?.multiplyScalar(.9); }   // v19: пробежка вдоль кромки не заходит в воду
       ob.position.x += (p.x - ob.position.x) * (1 - Math.exp(-dt * 4)); ob.position.z += (p.z - ob.position.z) * (1 - Math.exp(-dt * 4));
       ob.position.y += ((o.st === 'hide' || o.gone ? base.y : groundAt(ob.position.x, ob.position.z, .3)) - ob.position.y) * (1 - Math.exp(-dt * 5));
       ob.rotation.set(0, Math.atan2(out.x, out.z), 0); return;
@@ -2236,8 +2450,8 @@ export class Visual {
       o.off ??= new V3(); if (o.crawlTo) o.off.lerp(o.crawlTo, 1 - Math.exp(-dt * .25));
       const p = (o.sp === 'octopus' ? base.clone().add(new V3(Math.cos(o.t * .08 + o.seed) * .8, 0, Math.sin(o.t * .08 + o.seed) * .8)) : base.clone()).add(o.off);
       if (o.sp === 'starfish' && o.landOff) p.add(o.landOff);   // v21: отодвинута соседками
-      if (o.sp === 'octopus' && islandH(p.x, p.z) > -.6) p.set(base.x, 0, base.z);   // v19: на крутом склоне островка вылезал из воды
-      p.y = islandH(p.x, p.z) + (base.y - islandH(base.x, base.z));
+      if (o.sp === 'octopus' && hq(p.x, p.z) > -.6) p.set(base.x, 0, base.z);   // v19: на крутом склоне островка вылезал из воды
+      p.y = hq(p.x, p.z) + (base.y - hq(base.x, base.z));
       ob.position.lerp(p, 1 - Math.exp(-dt * 2));
       ob.rotation.set(0, o.seed + o.t * (o.sp === 'octopus' ? .05 : .01), 0);
       if (o.model && o.sp === 'octopus') o.model.scale.set(1 + Math.sin(o.t * 1.1) * .04, 1 - Math.sin(o.t * 1.1) * .05, 1 + Math.sin(o.t * 1.1) * .04);
@@ -2266,7 +2480,7 @@ export class Visual {
         for (const m of o.mats || []) m.emissiveIntensity = .5 + (1 - (this._day ?? 1)) * .5;
         if (o.halo) o.halo.material.opacity = .08 + (1 - (this._day ?? 1)) * .2;
         // лежит по склону песка, а не горизонтальным диском, висящим краем над землёй
-        const e = .6, gx = islandH(q.x + e, q.z) - islandH(q.x - e, q.z), gz = islandH(q.x, q.z + e) - islandH(q.x, q.z - e);
+        const e = .6, gx = hq(q.x + e, q.z) - hq(q.x - e, q.z), gz = hq(q.x, q.z + e) - hq(q.x, q.z - e);
         ob.quaternion.setFromUnitVectors(new V3(0, 1, 0), new V3(-gx, 2 * e, -gz).normalize()); ob.rotateY(o.seed); return;
       }
       o.jp = (o.jp ?? Math.random()) + dt / (2.2 + (o.seed % 1) * .8);
@@ -2292,7 +2506,7 @@ export class Visual {
       const a = o.ta, p = still ? base.clone() : base.clone().add(new V3(Math.cos(a) * 6, 0, Math.sin(a) * 6));
       if (!still) p.y = base.y + Math.pow(Math.max(0, Math.sin(o.t * .09 + o.seed)), 6) * 1.15;
       if (act('breathe', 9) && !still) p.y = -.25;
-      if (act('rest', 30) && !still) p.y = islandH(ob.position.x, ob.position.z) + .5;
+      if (act('rest', 30) && !still) p.y = hq(ob.position.x, ob.position.z) + .5;
       if (o.st === 'bask' && !o.gone) p.y = groundAt(ob.position.x, ob.position.z, .6) + .15;   // ползёт по песку
       ob.position.lerp(p, 1 - Math.exp(-dt * 1.2));
       pitch = -Math.atan2(ob.position.y - prev.y, 1e-3 + Math.hypot(ob.position.x - prev.x, ob.position.z - prev.z)) * .5;
@@ -2304,8 +2518,8 @@ export class Visual {
       const bury = act('bury', 25);
       o.sa = (o.sa ?? o.seed) + dt * (bury ? 0 : .16);
       const a = o.sa, p = base.clone().add(new V3(Math.cos(a) * 5, Math.sin(o.t * .5) * .15, Math.sin(a) * 5));
-      if (bury) p.y = islandH(ob.position.x, ob.position.z) + .12;
-      if (islandH(p.x, p.z) > -.5) p.set(base.x, p.y, base.z);   // v19: круг заходил на отмель островка — остаёмся над своей точкой
+      if (bury) p.y = hq(ob.position.x, ob.position.z) + .12;
+      if (hq(p.x, p.z) > -.5) p.set(base.x, p.y, base.z);   // v19: круг заходил на отмель островка — остаёмся над своей точкой
       ob.position.lerp(p, 1 - Math.exp(-dt * (bury ? .8 : 1.5)));
       roll = Math.sin(o.t * 1.6 + o.seed) * .12 * (bury ? 0 : 1);
       o.mixK = bury ? .08 : act('flap', 3) ? 3 : 1;
@@ -2316,11 +2530,14 @@ export class Visual {
       const spread = o.fleeT > 0 ? 2.2 : 1; o.fleeT = Math.max(0, (o.fleeT || 0) - dt);
       if (o.mats) { const fl = act('flash', 3) ? Math.sin(o.act.t / 3 * Math.PI) : 0; for (const m of o.mats) m.emissiveIntensity = 1 + fl * 2; }   // «вспыхивает в лучах»
       if (o.wig) { o.wig.t.value += dt * (o.fleeT > 0 ? 14 : 5); o.wig.a.value = 1; }
-      for (const sh of o.shrimp || []) {
-        const q = sh.m.position.clone();
-        sh.m.position.set(sh.off.x * spread + Math.sin(o.t * 1.7 + sh.ph) * .35, sh.off.y + Math.sin(o.t * 2.3 + sh.ph) * .15, sh.off.z * spread + Math.cos(o.t * 1.3 + sh.ph) * .35);
-        const v = sh.m.position.clone().sub(q); if (v.lengthSq() > 1e-8) sh.m.rotation.y = Math.atan2(v.x, v.z);
-      }
+      const SI = o.shrimpI, M = this._shM ||= new THREE.Matrix4(), Q = this._shQ ||= new THREE.Quaternion(), one = new V3(1, 1, 1), Yax = new V3(0, 1, 0);
+      (o.shrimp || []).forEach((sh, i) => {
+        const qx = sh.p.x, qz = sh.p.z;
+        sh.p.set(sh.off.x * spread + Math.sin(o.t * 1.7 + sh.ph) * .35, sh.off.y + Math.sin(o.t * 2.3 + sh.ph) * .15, sh.off.z * spread + Math.cos(o.t * 1.3 + sh.ph) * .35);
+        const vx = sh.p.x - qx, vz = sh.p.z - qz; if (vx * vx + vz * vz > 1e-8) sh.ry = Math.atan2(vx, vz);
+        if (SI) { M.compose(sh.p.clone().divideScalar(SI.sc), Q.setFromAxisAngle(Yax, sh.ry), one).multiply(SI.rest); SI.inst.setMatrixAt(i, M); }
+      });
+      if (SI) SI.inst.instanceMatrix.needsUpdate = true;
       return;
     } else if (o.sp === 'fish_school') {
       ob.position.copy(base);
@@ -2375,8 +2592,8 @@ export class Visual {
       if (!this.assets) return;
       const e = shoreAt(0, o.x * Math.PI * .9 + .3);
       let k = 5.5, x = e.x - e.dx * k, z = e.z - e.dz * k;
-      while (k > 2 && islandH(x, z) > 1.4) { k -= .25; x = e.x - e.dx * k; z = e.z - e.dz * k; }   // на песке, не в траве
-      o.nest = new V3(x, islandH(x, z), z); o.out = new V3(e.dx, 0, e.dz);
+      while (k > 2 && hq(x, z) > 1.4) { k -= .25; x = e.x - e.dx * k; z = e.z - e.dz * k; }   // на песке, не в траве
+      o.nest = new V3(x, hq(x, z), z); o.out = new V3(e.dx, 0, e.dz);
       const kit = this._hatchKit(), n = o.cnt || 12, m = o.hatchMesh = new THREE.InstancedMesh(kit.geo, kit.mat, n), C = new THREE.Color();
       const TONES = [[.42, .4, .34], [.36, .36, .33], [.46, .42, .36], [.38, .41, .37]];
       for (let i = 0; i < n; i++) m.setColorAt(i, C.setRGB(...TONES[i % 4].map(v => v * rnd(.9, 1.1))));
@@ -2391,11 +2608,11 @@ export class Visual {
       const age = o.t - q.born;
       if (age >= 0) {
         q.k = clamp(q.k + dt * (q.swim > 4 ? -.6 : 2));   // появился; отплыл — тает
-        if (age < 1.6) { boil = true; q.p.y = islandH(q.p.x, q.p.z) - .16 + age / 1.6 * .16; }   // выбирается из песка
+        if (age < 1.6) { boil = true; q.p.y = hq(q.p.x, q.p.z) - .16 + age / 1.6 * .16; }   // выбирается из песка
         else if (age > 1.6 + q.wait) {
           const dir = o.out.clone().applyAxisAngle(Y, q.a + Math.sin(o.t * 1.3 + q.ph) * .35);   // веером вниз по пляжу, виляя
           q.p.addScaledVector(dir, (q.wet ? .35 : q.sp) * dt); q.h = Math.atan2(dir.x, dir.z);
-          const g = islandH(q.p.x, q.p.z);
+          const g = hq(q.p.x, q.p.z);
           if (!q.wet && g < -.05) {   // кромка: крошечный всплеск
             q.wet = true; const w = q.p.clone().setY(.04), d = w.distanceTo(this.camera.position); this._ripple(w, .7, 1.1);
             if (d < 30) this.onLocalSound?.('splash', w, .3 * (1 - d / 30));
@@ -2480,11 +2697,11 @@ export class Visual {
     const cr = sp === 'crawl' && this.crawlers.find(c => c.kind === (q.get('kind') || 'ants'));   // ?crawl=1&look=crawl — букашки крупно
     // v21 QA: look=stranded — медуза на песке
     const pick = q => sp === 'stranded' ? q.sp === 'jellyfish' && q.st === 'stranded' : q.sp === sp;
-    const o = cl ? { obj: cl } : cr ? { obj: { position: new V3(cr.x, islandH(cr.x, cr.z), cr.z) } } : [...this.agents.values()].find(q => pick(q) && !q.gone && q.t > .3); if (!o) return;
+    const o = cl ? { obj: cl } : cr ? { obj: { position: new V3(cr.x, hq(cr.x, cr.z), cr.z) } } : [...this.agents.values()].find(q => pick(q) && !q.gone && q.t > .3); if (!o) return;
     const p = o.obj.position, d = cr ? 2.2 : cl ? 70 : sp === 'ship' ? 220 : sp === 'whale' ? 30 : sp === 'stranded' ? 4.5 : sp === 'crab' || sp === 'starfish' || sp === 'shrimp_swarm' || sp === 'cormorant' ? 6 : 12;
     const side = q.get('lookside') === '1';   // v21 QA: вид сбоку, почти с уровня воды
     this.controls.target.copy(p); this.camera.position.copy(p).add(side ? new V3(d * .95, Math.max(.4, -p.y + .6), d * .3) : new V3(d * .7, d * .55, d * .7)); this.controls.update();
-    this._looked = true; this._freeCam = true; console.log('QALOOK', sp, p.toArray().map(v => v.toFixed(1)).join(','), 'ground', islandH(p.x, p.z).toFixed(1));
+    this._looked = true; this._freeCam = true; console.log('QALOOK', sp, p.toArray().map(v => v.toFixed(1)).join(','), 'ground', hq(p.x, p.z).toFixed(1));
   }
 
   // морские звери не влезают друг в друга (дельфины стаи кружили по одинаковым кругам и сходились в одну модель)
@@ -2501,7 +2718,7 @@ export class Visual {
       const k = over * .5 / d * (1 - Math.exp(-dt * 6));
       for (const [o, p, s] of [[A, a, -1], [B, b, 1]]) {
         let mx = s * dx * k, mz = s * dz * k;
-        if (o.sp !== 'starfish' && islandH(p.x + mx, p.z + mz) < .15) {
+        if (o.sp !== 'starfish' && hq(p.x + mx, p.z + mz) < .15) {
           const c = siteOf(o.site > 0 ? o.site : 0), ix = c.cx - p.x, iz = c.cz - p.z, il = Math.hypot(ix, iz) || 1, st = Math.hypot(mx, mz);
           mx = ix / il * st; mz = iz / il * st;
         }
@@ -2512,7 +2729,7 @@ export class Visual {
     // v19: тело не ниже дна (+ полвысоты тела) — у всех, кто в воде; черепаха, уплывая с рифа, была «под рифом»
     for (const o of this.agents.values()) {
       const c = CLEAR[o.sp]; if (c === undefined || landed(o)) continue;
-      const p = o.obj.position, g = islandH(p.x, p.z) + c; if (p.y < g) p.y = g;
+      const p = o.obj.position, g = hq(p.x, p.z) + c; if (p.y < g) p.y = g;
     }
     // лев на суше — не пловец: его не расталкиваем
     const sw = [...this.agents.values()].filter(o => SWIM_R[o.sp] && !(o.sp === 'sea_lion' && !o.wet) && !landed(o));
@@ -2528,8 +2745,8 @@ export class Visual {
       const o = sw[i], need = SWIM_DEPTH[o.sp]; if (need === undefined || o.sp === 'sea_lion' || o.sp === 'pelican') continue;
       const hx = Math.sin(o.heading), hz = Math.cos(o.heading), half = HALF[o.sp] || 0;
       for (const k of half ? [-1, 0, 1] : [0]) {
-        const px = a.x + hx * half * k, pz = a.z + hz * half * k, g = islandH(px, pz); if (g <= need) continue;
-        const e = 1, gx = islandH(px + e, pz) - islandH(px - e, pz), gz = islandH(px, pz + e) - islandH(px, pz - e), L = Math.hypot(gx, gz) || 1;
+        const px = a.x + hx * half * k, pz = a.z + hz * half * k, g = hq(px, pz); if (g <= need) continue;
+        const e = 1, gx = hq(px + e, pz) - hq(px - e, pz), gz = hq(px, pz + e) - hq(px, pz - e), L = Math.hypot(gx, gz) || 1;
         const step = Math.min(8 * dt, (g - need) * .5); a.x -= gx / L * step; a.z -= gz / L * step;
       }
     }
@@ -2596,7 +2813,7 @@ export class Visual {
   _flyingFish(from) {
     const m = this._clone('fish'); if (!m) return;
     // «крылья»: у модели рыбы их нет, добавляем пару полупрозрачных плавников — узнаётся как летучая рыба
-    const wing = new THREE.PlaneGeometry(1.5, .5), wm = new THREE.MeshLambertMaterial({ color: 0xbfe8ff, emissive: 0x2a4a5a, transparent: true, opacity: .75, side: THREE.DoubleSide });
+    const wing = new THREE.PlaneGeometry(1.5, .5), wm = new THREE.MeshLambertMaterial({ color: 0xbfe8ff, emissive: 0x2a4a5a, transparent: true, opacity: .75, side: THREE.DoubleSide, forceSinglePass: true });
     for (const sgn of [-1, 1]) {
       const w = new THREE.Mesh(wing, wm); w.position.set(sgn * .5, .12, 0); w.rotation.set(-Math.PI / 2, 0, sgn * .35); m.obj.add(w);
     }
@@ -2646,11 +2863,13 @@ export class Visual {
   focusEvent(r) {
     if (!r) return;
     const o = r.agent != null && this.agents.get(r.agent);
-    if (o && !o.gone) { this._fly = null; this._follow = { id: o.id, sp: o.sp, t: 0, dist: FOLLOW_D[o.sp] || 12 }; this._freeCam = false; this._censusHTML = null; this.onDiscover?.(o.sp); return; }   // v23: следит — найден
+    if (o && !o.gone) { this.followAgent(o); return; }
     const p = r.pos.clone(), hr = Math.hypot(p.x, p.z); if (hr > 150) { p.x *= 150 / hr; p.z *= 150 / hr; }
-    p.y = clamp(p.y, Math.max(0, islandH(p.x, p.z) + .5), 30);
+    p.y = clamp(p.y, Math.max(0, hq(p.x, p.z) + .5), 30);
     this._follow = null; this._fly = { p, t: 0 }; this._idle = 0;
   }
+  // слежение за этим зверем (журнал, двойное нажатие по зверю); v23: следит — вид найден (бестиарий)
+  followAgent(o) { this._fly = null; this._follow = { id: o.id, sp: o.sp, t: 0, dist: FOLLOW_D[o.sp] || 12 }; this._freeCam = false; this._censusHTML = null; this.onDiscover?.(o.sp); }
   _stepFly(dt) {
     const f = this._fly; if (!f) return;
     const tg = this.controls.target, cam = this.camera.position, k = 1 - Math.exp(-dt * 2.2), before = tg.clone();
@@ -2678,21 +2897,27 @@ export class Visual {
   // зверь ловился, только если курсор ближе 34 px к центру модели — у кита и у косяка (центр — пустота между рыбами)
   // это малая часть тела, а у плывущего зверя центр то входил в круг, то выходил. Теперь зона — по размеру зверя на
   // экране, у уже выбранного она в 1.6 раза шире; подпись стоит над зверем и держится 0.35 с, если курсор соскочил
-  _updateHover(dt = 0) {
-    if (!this._mouseOver) { this._hov = null; this.tipEl.classList.remove('show'); return; }
-    const w = this.w, h = this.h, mx = this._mouse.x, my = this._mouse.y, v = this._hv ??= new V3(), cam = this.camera.position;
+  // зверь под точкой экрана (mx, my — от угла сцены): ближайший по размеру тела на экране; у уже выбранного (подпись)
+  // зона в 1.6 раза шире; wide — для двойного нажатия пальцем (палец толще курсора)
+  _pickAt(mx, my, wide = 1) {
+    const w = this.w, h = this.h, v = this._hv ??= new V3(), cam = this.camera.position;
     const pxPerM = h / (2 * Math.tan(this.camera.fov * Math.PI / 360));   // пикселей экрана на метр на расстоянии 1 м
-    let best = null, bestK = 1, bx = 0, by = 0, br = 0;
+    let best = null, bestK = 1;
     for (const o of this.agents.values()) {
       if (o.gone) continue;
       v.copy(o.obj.position).project(this.camera);
       if (v.z > 1 || v.z < -1) continue;
       const px = (v.x * .5 + .5) * w, py = (-v.y * .5 + .5) * h, d = Math.hypot(px - mx, py - my);
       const rad = clamp((BODY_R[o.sp] ?? 1.5) * pxPerM / Math.max(1, o.obj.position.distanceTo(cam)), 0, 260);
-      const k = d / (Math.max(30, rad) * (o === this._hov ? 1.6 : 1));
-      if (k < bestK) { bestK = k; best = o; bx = px; by = py; br = rad; }
+      const k = d / (Math.max(30, rad) * (o === this._hov ? 1.6 : 1) * wide);
+      if (k < bestK) { bestK = k; best = o; this._pickP = [px, py, rad]; }
     }
-    if (best) { this._hov = best; this._hovT = .35; this._hovP = [bx, by, br]; }
+    return best;
+  }
+  _updateHover(dt = 0) {
+    if (!this._mouseOver) { this._hov = null; this.tipEl.classList.remove('show'); return; }
+    const best = this._pickAt(this._mouse.x, this._mouse.y);
+    if (best) { this._hov = best; this._hovT = .35; this._hovP = this._pickP; }
     else if (this._hov && ((this._hovT -= dt) <= 0 || this._hov.gone)) this._hov = null;
     const o = this._hov;
     if (o) {
@@ -2704,6 +2929,20 @@ export class Visual {
     } else this.tipEl.classList.remove('show');
   }
 
+  // v24: оценка памяти картинки для ?debug=1 (МБ): текстуры (с мип-уровнями), геометрии, буфер кадра
+  memEstimate() {
+    const tex = new Set(), geo = new Set();
+    const visit = o => o.traverse(n => { if (n.geometry) geo.add(n.geometry);
+      for (const m of [n.material].flat()) { if (!m) continue; for (const k in m) if (m[k]?.isTexture) tex.add(m[k]);
+        if (m.uniforms) for (const u of Object.values(m.uniforms)) if (u?.value?.isTexture) tex.add(u.value); } });
+    visit(this.scene); if (this.warm) visit(this.warm); for (const a of Object.values(this.assets || {})) visit(a.obj);
+    let t = 0, g = 0;
+    for (const x of tex) { const w = x.image?.width || 0, h = x.image?.height || 0; t += w * h * (x.type === THREE.HalfFloatType ? 8 : x.type === THREE.FloatType ? 16 : 4) * (x.generateMipmaps !== false && x.minFilter > THREE.LinearFilter ? 1.33 : 1); }
+    for (const x of geo) { for (const a of Object.values(x.attributes)) g += a.array?.byteLength || 0; if (x.index) g += x.index.array.byteLength; }
+    const W = this.rt.width, H = this.rt.height, S = this.rt.samples;
+    return { tex: t / 1048576, geo: g / 1048576, rt: W * H * 4 * (1.33 + (S ? 2 * S : 1) + 1) / 1048576 };
+  }
+
   // насколько камера близко к острову (0 далеко .. 1 вплотную) — для звука насекомых
   proximity() {
     const c = this.camera.position, d = Math.hypot(c.x, c.z);
@@ -2713,8 +2952,10 @@ export class Visual {
   // качество картинки (v21 — только понижение по частоте кадров; v22 — и выбор в настройках, см. main.js): k — доля
   // разрешения от basePR, msaa — сглаживание буфера (в программном рендере его нет вовсе)
   // v23: life — доля растений, светлячков и мотыльков (раскладка случайная — редеют равномерно)
-  setQuality({ k = 1, msaa = true, life = 1 } = {}) {
-    const pr = this.basePR * k, samples = msaa && !this.soft ? 4 : 0;
+  // v24: lite — «Лёгкое»: уже загруженные текстуры моделей ужимаются до 256 (обратно не растут — до перезагрузки)
+  setQuality({ k = 1, msaa = true, life = 1, lite = false } = {}) {
+    const pr = this.basePR * k, samples = msaa && !this.soft ? (msaa === true ? 4 : msaa) : 0;   // v24: msaa — да/нет или число отсчётов (?bench=1)
+    if (lite && !this.lite) { this.lite = true; for (const a of Object.values(this.assets || {})) a.obj.traverse(n => { for (const m of [n.material].flat()) if (m?.map) this._fitTex(m.map); }); }
     for (const m of this.flora || []) m.count = Math.round(m.userData.n * life);
     for (const g of this.flies || []) g.setDrawRange(0, Math.round(g.attributes.position.count * life));
     if (this.mothGeo) this.mothGeo.instanceCount = Math.round(this.mothGeo.userData.n * life);
@@ -2786,6 +3027,9 @@ export class Visual {
     if (this.moteMat) this.moteMat.uniforms.uK.value = lerp(1, .3, day);
     if (this.plankton) { this.plankton.uniforms.uK.value = smooth(.6, .1, day) * 1.3; this.fireflies.uniforms.uK.value = smooth(.5, .05, day) * (1 - this.cur.rain); }
     if (this.mothMat) this.mothMat.uniforms.uK.value = smooth(.5, .05, day) * (1 - this.cur.rain);   // v23: мотыльки — как светлячки
+    // v24: днём светлячков, мотыльков и ближнего планктона не видно (uK = 0) — и не рисуем
+    for (const p of this.glowPts || []) p.visible = p.material.uniforms.uK.value > .002;
+    if (this.mothMesh) this.mothMesh.visible = this.mothMat.uniforms.uK.value > .002;
     if (this.farPlankton) this.farPlankton.uniforms.uK.value = (lerp(.18, 1.2, smooth(.75, .1, day)) + dusk * .4) * (1 - this.cur.fog * .7);
     if (this.foamMat) this.foamMat.uniforms.uWave.value = this.cur.wave;
 
@@ -2800,27 +3044,39 @@ export class Visual {
       u.mat.color.copy(cCol); u.mat.emissive.copy(cEm);
       u.mat.opacity = .5 * smooth(u.w * .6, u.w * 1.8, c.position.distanceTo(this.camera.position)); u.pre.visible = u.mat.opacity > .03;   // вплотную к камере — тает
     }
-    for (const p of this.palms || []) p.rotation.z = Math.sin(t * (.8 + this.cur.wind) + p.userData.seed) * (.01 + this.cur.wind * .03);
+    for (const m of this.palms || []) this._swayPalms(m, t);
 
     this.flashV = Math.max(0, (this.flashV || 0) - dt * 2.6); this.flashEl.style.opacity = (this.flashV * .4).toFixed(3);
     const ru = this.rain.material.uniforms; ru.uTime.value = t; ru.uAmt.value = this.cur.rain; ru.uSlant.value = .18 + this.cur.wind * .35;
 
     this._stepFollow(dtc); this._stepFly(dtc); this._followChip();
     if (!this._drag) this._idle += dtc;
-    const spin = this.controls.autoRotate = !this._follow && !this._fly && !this.paused && !this._freeCam && this._idle > 12;   // v15: через 12 с (было 20)
+    // v24: облёт — через 20 с покоя (было 12); облётом ведёт кадр сам (азимут, высота, точка взгляда), не autoRotate
+    const spin = !this._follow && !this._fly && !this.paused && !this._freeCam && this._idle > 20;
+    this.controls.autoRotate = false;
     if (spin) {
-      // v16: облёт — вокруг всей локации (центр острова), камера на ~105 м под ~46°; когда она проходит над стороной
-      // рифа (дуга в 55–82 м к +z), центр кадра плавно смещается к рифу — он отчётливо виден внизу кадра; с других
-      // сторон взгляд снова на центре (в v15 центр был всё время у рифа — «крутится только вокруг коралла») — риф виден сквозь воду, что на нём происходит
-      this._spinQA ??= new URLSearchParams(location.search).has('spinqa');   // QA: сразу в кадр облёта
-      const tg0 = this.controls.target, k = this._spinQA ? 1 : 1 - Math.exp(-dt * .15);
-      const th = Math.atan2(this.camera.position.x - tg0.x, this.camera.position.z - tg0.z), reefK = Math.max(0, Math.cos(th)) ** 2;
-      const d0 = new V3(0, 0, 50 * reefK).sub(tg0).multiplyScalar(this._spinQA ? 1 : 1 - Math.exp(-dt * .4));
-      tg0.add(d0); this.camera.position.add(d0);
-      const sp = new THREE.Spherical().setFromVector3(this.camera.position.clone().sub(tg0));
-      sp.radius = lerp(sp.radius, 105, k); sp.phi = lerp(sp.phi, .8, k);
-      this.camera.position.copy(tg0).add(new V3().setFromSpherical(sp));
+      // v24 (по видео автора, середина между прежним облётом и видео): низко над водой (17°) — горизонт и небо в кадре, оборот
+      // 165 с вокруг главного острова, расстояние ~100 м мягко «дышит». Риф: когда камера проходит над его стороной
+      // (+z, дуга 82 м), точка взгляда плавно переходит на ближний к камере участок рифа, камера подходит к нему (~48 м) и
+      // смотрит круче — риф виден сквозь воду в середине кадра, остров у верхнего края; дальше так же плавно обратно.
+      // Подбор на глаз: ?h= — угол над водой (градусы), ?turn= — секунд на оборот
+      const qs = this._orbQ ??= new URLSearchParams(location.search), H = (+qs.get('h') || 17) * Math.PI / 180, TURN = +qs.get('turn') || 165;   // выбор автора 03.10: 17° и 165 с
+      this._spinQA ??= qs.has('spinqa');   // QA: сразу в кадр облёта
+      const tg0 = this.controls.target, cam0 = this.camera.position;
+      if (!this._spun) this._orbA = Math.atan2(cam0.x, cam0.z);   // облёт продолжается оттуда, где камеру отпустили
+      this._orbA -= dt * 2 * Math.PI / TURN; this._orbA = Math.atan2(Math.sin(this._orbA), Math.cos(this._orbA));   // в ту же сторону, что и прежний облёт
+      const a = this._orbA, w = smooth(.3, .92, Math.cos(a)), ar = clamp(a, -.75, .75);
+      // высота точки взгляда — плавно от середины острова к воде над рифом (границы точки обзора ниже на облёте не действуют:
+      // на склонах они дёргали её вверх-вниз — рывки камеры)
+      this._orbC ??= Math.max(4, islandH(0, 0) + .6);
+      const T = new V3(Math.sin(ar) * 82 * w, this._orbC * (1 - w), Math.cos(ar) * 82 * w);
+      const D = lerp(100 * (1 + .15 * Math.sin(this.clock * .09)), 48, w), e = lerp(H, .52, w);
+      const C = new V3(Math.sin(a) * Math.cos(e), Math.sin(e), Math.cos(a) * Math.cos(e)).multiplyScalar(D).add(T);
+      // вход в облёт и любые расхождения — плавно (~2.5 с), без рывка
+      const k = this._spinQA ? 1 : 1 - Math.exp(-dt * .4);
+      tg0.lerp(T, k); cam0.lerp(C, k);
     }
+    this._spun = spin;
     this.controls.update(dtc);
     this._qaLook();
     // границы (v13 свободнее): точка обзора — в пределах 150 м от острова (островки, риф, звери вокруг), по высоте — от
@@ -2828,18 +3084,18 @@ export class Visual {
     // а на вершинах выше 8 м «потолок» и «не ниже рельефа» спорили: точку тянуло вниз вместе с камерой, а вверх — одну,
     // и камера каждый кадр оседала к острову («сама зумит, потом не оторвать»)
     const tg = this.controls.target, cam = this.camera.position;
-    if (!this._freeCam && !this._follow) {
+    if (!this._freeCam && !this._follow && !spin) {
       const want = tg.clone(), hr = Math.hypot(tg.x, tg.z);
       if (hr > 150) { want.x *= 150 / hr; want.z *= 150 / hr; }
-      want.y = clamp(want.y, Math.max(0, islandH(want.x, want.z) + .5), 30);
+      want.y = clamp(want.y, Math.max(0, hq(want.x, want.z) + .5), 30);
       const off = want.sub(tg).multiplyScalar(1 - Math.exp(-dtc * 4)); tg.add(off); cam.add(off);
     }
     // камера — не под воду и не сквозь остров
-    const floor = Math.max(1.5, islandH(cam.x, cam.z) + 1.5); if (cam.y < floor) cam.y = floor;
+    const floor = Math.max(1.5, hq(cam.x, cam.z) + 1.5); if (cam.y < floor) cam.y = floor;
     // небо, звёзды, солнце, луна — вокруг камеры: у мира нет края, куда можно «выехать»
     this.sky.position.copy(cam); this.stars.position.copy(cam);
     this.sunGlow.position.add(cam); this.sunDisc.position.add(cam); this.moon.position.add(cam);
-    this.water.position.x = cam.x; this.water.position.z = cam.z;
+    const WC = 10000 / this.waterN; this.water.position.x = Math.round(cam.x / WC) * WC; this.water.position.z = Math.round(cam.z / WC) * WC;
     this._day = day;
     // общий такт стай (v14: дельфины на ночном отдыхе кружат втрое медленнее)
     const dRest = [...this.agents.values()].some(q => q.sp === 'dolphin' && q.st === 'rest');
@@ -2848,10 +3104,11 @@ export class Visual {
     this._separate(dt);
     this._nearSounds(dt);
     if (this.shoals) this._stepAmbient(dt, t);
-    this._floraAvoid();
+    this._floraAvoid(dt);
     for (let i = this.fx.length - 1; i >= 0; i--) if (!this.fx[i](dt)) this.fx.splice(i, 1);
     this._updateHover(dtc); this._stepLog(dt);
     this.renderer.setRenderTarget(this.rt); this.renderer.render(this.scene, this.camera);
+    const ri = this.renderer.info.render; this.drawn = { calls: ri.calls, tris: ri.triangles + ri.points + ri.lines };   // v24: для ?debug=1
     this.renderer.setRenderTarget(null); this.renderer.render(this.postScene, this.postCam);
     return P;
   }

@@ -7,6 +7,7 @@
 // браузер не даст звуку начаться), .update(state) на каждый /state, .onEvent(e) на каждый /event.
 
 import { Music } from './music.js';
+import { step, within, device } from './boot.js';
 const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
 const lerp = (a, b, t) => a + (b - a) * t;
 const rrand = (a, b) => a + Math.random() * (b - a);
@@ -63,7 +64,7 @@ function wander(seed) {
 }
 
 export class OceanAudio {
-  constructor(baseUrl = '') {
+  constructor(baseUrl = '', { lite = false } = {}) {
     this.base = baseUrl;
     this.ready = false;
     this.manifest = null;
@@ -84,8 +85,12 @@ export class OceanAudio {
     // вкладку): записи в 32 кГц (на iPhone/iPad звук играет в родной частоте устройства, а записи распаковываются в 32 кГц —
     // см. _decoder), звуки зверей — по первому звуку, петли насекомых — только играющие. На обычных устройствах — всё как
     // было. ?lite=1 — включить для проверки
-    const ios = this.ios = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-    this.lite = ios || (navigator.deviceMemory > 0 && navigator.deviceMemory <= 4) || new URLSearchParams(location.search).get('lite') === '1';
+    // v24: и телефоны, у браузера которых нет deviceMemory (Firefox и др.: память неизвестна — раньше там грузилось всё,
+    // как на ПК), и «Лёгкое» качество (lite из main.js). В «Лёгком» ещё и выгружаются записи, давно не звучавшие (_evict)
+    const ios = this.ios = device.ios;
+    this.tiny = lite;
+    this.lite = ios || lite || (device.mem !== null ? device.mem <= 4 : device.touch) || new URLSearchParams(location.search).get('lite') === '1';
+    this.used = {};             // категория -> когда звучала (для выгрузки в «Лёгком»)
     // v21: слабое устройство (main.js включает, если картинка долго ниже ~24 кадров/с): не больше 10 разовых звуков
     // одновременно, слой обновляется 12 раз в секунду, без «эха» абстрактного слоя — меньше работы звуковому потоку
     // (треск/обрывы). На облегчённом (iPhone) предел голосов действует всегда. Обычные устройства — как было
@@ -149,8 +154,11 @@ export class OceanAudio {
     if (!(window.AudioContext || window.webkitAudioContext)) throw Object.assign(new Error('этот браузер не поддерживает Web Audio'), { noAudio: true });
     this.unlock();   // обычно уже вызван из нажатия (main.js) — тогда контекст тот же
     const ctx = this.ctx;
+    if (!ctx) throw Object.assign(new Error('звук не включился'), { noAudio: true });
     // v22: resume() в iOS иногда не отвечает (контекст «interrupted») — не ждём дольше 3 с, звук догонит при следующем нажатии
+    const st = step('звук: включение');
     await Promise.race([ctx.resume(), new Promise(r => setTimeout(r, 3000))]);
+    st.done(ctx.state === 'running' || 'long', ctx.state);
     if (this.paused) ctx.suspend().catch(() => {});   // пауза поставлена до конца входа — звук не включаем
     this.t0 = ctx.currentTime;
 
@@ -182,30 +190,54 @@ export class OceanAudio {
     // v19: статический сайт (GitHub Pages, APK — build_site.py) — список записей (MP3) в samples.json рядом со страницей
     // v21: список проверяется — PWA-манифест (тот же адрес manifest.json на статическом сайте) за него не принимается
     const isList = m => m && Array.isArray(m.surf);
-    const get = async u => { try { const r = await fetch(u); return r.ok ? await r.json() : null; } catch { return null; } };
+    const get = async u => { try { const r = await fetchIn(u, 10000); return r.ok ? await r.json() : null; } catch { return null; } };   // v24: не дольше 10 с
+    const sl = step('звук: список записей');
     let man = await get(this.base + '/samples.json');
     if (!isList(man)) man = await get(this.base + '/manifest.json?fmt=' + (opus ? 'opus' : 'mp3'));
-    if (!isList(man)) throw new Error('не найден список звуков (samples.json)');
+    sl.done(isList(man));
+    if (!isList(man)) throw Object.assign(new Error('не найден список звуков (samples.json)'), { noAudio: true });   // v24: мир — без звука, а не «нажми ещё раз»
     this.manifest = man;
     if (this.lite) {   // v21: петли насекомых — только те, что заиграют (из 6/5 записей звучат 3/2, см. _buildInsects)
       const pick = (a, k) => (a || []).slice().sort(() => Math.random() - .5).slice(0, k);
       this.manifest = { ...this.manifest, insects_day: pick(this.manifest.insects_day, 3), insects_night: pick(this.manifest.insects_night, 2) };
     }
-    // v22: всё, без чего не войти, — разом и без очереди (fast)
-    await Promise.all(['surf', 'rain_light', 'rain_heavy', 'rain_water', 'insects_day', 'insects_night'].map(c => this._loadCategory(c, true)));
-
-    this._buildSurf();
+    // v24: вход ждёт только прибой, и не дольше 5 с — каждая запись прибоя вступает, как только распакована. Раньше вход
+    // ждал прибой, три дождя и насекомых разом (20 записей, ~265 МБ распакованного звука) без предела времени: на слабом
+    // телефоне распаковка падала или не возвращалась — «Открываю иллюминатор…» висело вечно. Ветер, гул глубины и музыка —
+    // синтез, звучат сразу; дождь и насекомые подтягиваются после входа (на облегчённом — когда понадобятся, см. update)
+    this.surf = []; this.rain = { light: [], heavy: [], water: [] }; this.insects = { day: [], night: [] };
     this._buildWind();
     this._buildDepth();
-    this._buildRain();
-    this._buildInsects();
+    const ss = step('звук: прибой');
+    const surf = this._loadCategory('surf', !this.lite, b => { this._addSurf(b); ss.note(`${this.surf.length} из ${this.manifest.surf.length}`); });
+    await within(surf, 5000, 'прибой').then(() => ss.done(this.surf.length > 0), e => { ss.done('long', e.message); console.warn('звук:', e.message, '— входим, прибой догрузится'); });
     this.ready = true;
     // остальное (плеск, птицы, киты...) подгружаем лениво по первому событию — не тормозим старт
     // v22: по одной категории за раз, а не все 16 разом: раньше за ~10 с после входа распаковывалось ~230 записей,
     // кадры стояли по 0.7–1.4 с (замер qa/perf_profile.mjs). Категория, чей звук нужен раньше очереди, грузится сразу
-    if (!this.lite) (async () => { for (const c of ['splash', 'gull', 'tern', 'cormorant', 'whale', 'whale_blow', 'horn', 'dolphin', 'orca', 'seal', 'fish', 'thunder', 'grasshopper', 'bubbles', 'shrimp', 'crab']) await this._loadCategory(c); })();
     // v21: на облегчённом — категория грузится при первом своём звуке (onEvent/playLocal ждут её)
+    if (!this.lite) (async () => {
+      for (const c of LOOPS) await this._loadLayer(c);
+      for (const c of ['splash', 'gull', 'tern', 'cormorant', 'whale', 'whale_blow', 'horn', 'dolphin', 'orca', 'seal', 'fish', 'thunder', 'grasshopper', 'bubbles', 'shrimp', 'crab']) await this._loadCategory(c);
+    })();
   }
+
+  // v24: петля дождя или насекомых — загрузить и включить (один раз; не вышло — повтор при следующей просьбе)
+  _loadLayer(cat) {
+    return (this._layers ??= {})[cat] ??= this._loadCategory(cat).then(b => {
+      if (!b.length) { delete this._layers[cat]; return; }
+      if (cat.startsWith('rain_')) this.rain[cat.slice(5)] = this._rainLoops(b);
+      else this.insects[cat === 'insects_day' ? 'day' : 'night'] = this._insectLoops(cat, b, cat === 'insects_day' ? 3 : 2);
+    }).catch(() => { delete this._layers[cat]; });
+  }
+
+  // v24: «Лёгкое» — разовые записи, не звучавшие 2 минуты, выгружаются (загрузятся снова при следующем звуке); петли
+  // (прибой, дождь, насекомые) не трогаем — они играют постоянно
+  _evict(now) {
+    if (!this.tiny || now - (this._evT ?? 0) < 15) return; this._evT = now;
+    for (const c of Object.keys(this.buffers)) if (!LOOP_SET.has(c) && now - (this.used[c] ?? now) > 120) { delete this.buffers[c]; delete this._loading[c]; delete this.recent[c]; }
+  }
+  memMB() { let b = 0; for (const bs of Object.values(this.buffers)) for (const x of bs) b += x.length * x.numberOfChannels * 4; return b / 1048576; }
 
   // v22: чем распаковывать записи. На iPhone/iPad (облегчённый звук) контекст работает в родной частоте устройства (44.1/48
   // кГц), и записи, распакованные им, занимали в 1.5 раза больше памяти, чем в v21 (там весь звук был в 32 кГц), — а iOS
@@ -221,24 +253,28 @@ export class OceanAudio {
     return this._dctx || this.ctx;
   }
 
-  async _loadCategory(cat, fast = false) {
+  async _loadCategory(cat, fast = false, onBuf = null) {
     if (this.buffers[cat]) return this.buffers[cat];
     if (this._loading[cat]) return this._loading[cat];
+    this.used[cat] = this.ctx.currentTime;
     const files = (this.manifest[cat] || []);
     // v21: allSettled + r.ok — одна битая запись не глушит категорию; ничего не загрузилось — повтор при следующем звуке
     // v22: записи категории скачиваются вместе, а распаковываются по одной (очередь this._dec) и частями: распаковка,
     // нормализация и разбор записи — работа главного потока, пачкой они останавливали кадр. fast — для записей, без которых
     // не войти (прибой, дождь, насекомые): человек ждёт на экране входа — распаковка сразу и целиком (как в v21: в v22 вход
     // из-за очереди стал вдвое дольше)
+    // v24: у скачивания (30 с) и распаковки (15 с) — предел времени: при нехватке памяти decodeAudioData на телефоне
+    // может не вернуться вовсе — запись пропускается, очередь и вход идут дальше
     const one = async ab => {
-      const step = fast ? Infinity : CHUNK, b = await normalize(await decode(this._decoder(), ab), .8, step);   // как b.normalize(0.8) в ocean_live.scd
+      const step = fast ? Infinity : CHUNK, b = await normalize(await within(decode(this._decoder(), ab), 15000, `распаковка ${cat}`), .8, step);   // как b.normalize(0.8) в ocean_live.scd
       if (WINDOW[cat] || LEVEL.has(cat)) this.info.set(b, await analyse(b, step));
+      onBuf?.(b);
       return b;
     };
     this._loading[cat] = Promise.allSettled(files.map(async f => {
-      const r = await fetch(`${this.base}/samples/${cat}/${f}`);
+      const r = await fetchIn(`${this.base}/samples/${cat}/${f}`, 30000);
       if (!r.ok) throw new Error(`${cat}/${f}: HTTP ${r.status}`);
-      const ab = await r.arrayBuffer();
+      const ab = await within(r.arrayBuffer(), 30000, `${cat}/${f}`);
       return fast ? one(ab) : (this._dec = (this._dec || Promise.resolve()).catch(() => {}).then(() => one(ab)));
     })).then(res => {
       for (const x of res) if (x.status === 'rejected') console.warn('звук не загрузился:', x.reason?.message || x.reason);
@@ -263,17 +299,16 @@ export class OceanAudio {
   }
 
   // --- постоянные слои -----------------------------------------------------
-  _buildSurf() {
-    const ctx = this.ctx, bufs = this.buffers.surf || [];
-    this.surf = bufs.map((b, i) => {
-      const src = ctx.createBufferSource(); src.buffer = b; src.loop = true;
-      src.playbackRate.value = [1, .97, 1.03, .985, 1.015, .99][i % 6];
-      const lpf = ctx.createBiquadFilter(); lpf.type = 'lowpass'; lpf.frequency.value = 8000;
-      const g = ctx.createGain(); g.gain.value = 0;
-      src.connect(lpf); lpf.connect(g); g.connect(this.bus);
-      src.start(0, Math.random() * b.duration);
-      return { src, lpf, g };
-    });
+  // v24: по одной петле — как только запись распакована (вход не ждёт все шесть); громкость — с ближайшего update
+  _addSurf(b) {
+    const ctx = this.ctx, i = this.surf.length;
+    const src = ctx.createBufferSource(); src.buffer = b; src.loop = true;
+    src.playbackRate.value = [1, .97, 1.03, .985, 1.015, .99][i % 6];
+    const lpf = ctx.createBiquadFilter(); lpf.type = 'lowpass'; lpf.frequency.value = 8000;
+    const g = ctx.createGain(); g.gain.value = 0;
+    src.connect(lpf); lpf.connect(g); g.connect(this.bus);
+    src.start(0, Math.random() * b.duration);
+    this.surf.push({ src, lpf, g });
   }
   // wind: синтез шума + фильтры (порт SynthDef(\wind) из ocean_synths.scd v3)
   _buildWind() {
@@ -301,8 +336,9 @@ export class OceanAudio {
     rumble.connect(g); modalG.connect(g); g.connect(this.bus);
     this.depth = { rumble, g, w: wander(.29) };
   }
-  _buildRain() {
-    const ctx = this.ctx, mk = cat => (this.buffers[cat] || []).map(b => {
+  _rainLoops(bufs) {
+    const ctx = this.ctx;
+    return bufs.map(b => {
       const src = ctx.createBufferSource(); src.buffer = b; src.loop = true;
       const lpf = ctx.createBiquadFilter(); lpf.type = 'lowpass'; lpf.frequency.value = 14000;
       const g = ctx.createGain(); g.gain.value = 0;
@@ -310,13 +346,13 @@ export class OceanAudio {
       src.start(0, Math.random() * b.duration);
       return { g };
     });
-    this.rain = { light: mk('rain_light'), heavy: mk('rain_heavy'), water: mk('rain_water') };
   }
 
   // насекомые у острова: слышны, только когда камера близко (this.prox); днём цикады/поющие насекомые, ночью сверчки.
   // Несколько петель одновременно с разными скоростями — «разные насекомые», а не одна запись по кругу.
-  _buildInsects() {
-    const ctx = this.ctx, mk = (cat, k) => (this.buffers[cat] || []).slice().sort(() => Math.random() - .5).slice(0, k).map((b, i) => {
+  _insectLoops(cat, bufs, k) {
+    const ctx = this.ctx;
+    return bufs.slice().sort(() => Math.random() - .5).slice(0, k).map((b, i) => {
       const src = ctx.createBufferSource(); src.buffer = b; src.loop = true; src.playbackRate.value = [1, .96, 1.05][i % 3];
       const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 900;   // без «гула» полевой записи
       // v15: и без «шипения» — выше 7 кГц у полевых записей насекомых в основном ровный шум (пользователь: «белый шум»)
@@ -327,7 +363,6 @@ export class OceanAudio {
       src.start(0, Math.random() * b.duration);
       return { g, k: clamp((this.info.get(this.buffers[cat]) || 1) / (this.info.get(b)?.rms || 1), .5, 2) };   // выровнять по средней громкости
     });
-    this.insects = { day: mk('insects_day', 3), night: mk('insects_night', 2) };
   }
 
   // --- вызывать на каждый /state (та же математика, что в OSCdef(\state)) --
@@ -363,6 +398,9 @@ export class OceanAudio {
     }
     const on = !!s.rain_active;
     this.rainOn = on;
+    // v24: облегчённый — дождь грузится, когда пошёл, насекомые — когда камера подлетела к острову; «Лёгкое» — выгрузка
+    if (this.lite) { if (on) for (const c of ['rain_light', 'rain_water', 'rain_heavy']) this._loadLayer(c); if (this.prox > .02) for (const c of ['insects_day', 'insects_night']) this._loadLayer(c); }
+    this._evict(now);
     const heavy = clamp((s.rain - .55) / .25);
     for (const g of this.rain.light) g.g.gain.setTargetAtTime(on ? rl : 0, now, 20);
     for (const g of this.rain.water) g.g.gain.setTargetAtTime(on ? rl : 0, now, 20);
@@ -381,6 +419,7 @@ export class OceanAudio {
     const sp = SPEC[e.type]; if (!sp) return;
     if (e.delay) await new Promise(r => setTimeout(r, e.delay * 1000));
     const [cat, r0, r1, a0, a1, l0, l1, atk, rel] = sp;
+    this.used[cat] = this.ctx.currentTime;
     const bufs = this.buffers[cat] || await this._loadCategory(cat);
     if (!bufs.length) return;
     const dist = e.distance ?? .5, voice = e.agent ? (e.voice || e.agent) : 0;
@@ -455,6 +494,7 @@ export class OceanAudio {
   // разовый «местный» звук от картинки (кузнечик прыгнул рядом с камерой): cat — папка, pan01/dist — от камеры
   async playLocal(cat, pan01 = .5, dist = 0, amp = .06, rate = 1) {
     if (!this.ready) return;
+    this.used[cat] = this.ctx.currentTime;
     const bufs = this.buffers[cat] || await this._loadCategory(cat);
     if (!bufs.length) return;
     const rec = this.recent[cat] || [], pool = bufs.filter(b => !rec.includes(b)), buf = choice(pool.length ? pool : bufs);
@@ -498,6 +538,9 @@ export class OceanAudio {
 
 // v22: распаковка с обратным вызовом — так она работает и в старом Safari (до 14.1 decodeAudioData не возвращала
 // Promise: звук на таких iPhone не загружался вовсе), и в новых браузерах
+// v24: скачивание с пределом времени (AbortController — есть и в старом Safari)
+const fetchIn = (u, ms) => { const ac = new AbortController(), t = setTimeout(() => ac.abort(), ms); return fetch(u, { signal: ac.signal }).finally(() => clearTimeout(t)); };
+const LOOPS = ['rain_light', 'rain_water', 'rain_heavy', 'insects_day', 'insects_night'], LOOP_SET = new Set(['surf', ...LOOPS]);
 const decode = (ctx, ab) => new Promise((res, rej) => { const p = ctx.decodeAudioData(ab, res, rej); if (p?.catch) p.catch(rej); });
 // v22: длинные циклы по записи — частями по ~0.25 млн отсчётов с паузой между ними (запись кита — 3.4 млн отсчётов,
 // одним куском это десятки мс на телефоне посреди кадра). Порядок вычислений прежний — результат тот же
